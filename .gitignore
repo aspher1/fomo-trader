@@ -1,0 +1,19 @@
+# key material - NEVER commit
+keypair.json
+*.pem
+*.key
+.env
+.env.*
+
+# live runtime state (journals, logs, pidfiles)
+runs/
+*.log
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# local scratch
+workspace/tmp/
