@@ -60,7 +60,7 @@ def test_manage_tick_cadence_price_and_liquidity(tmp_path, chain, native):
     t.state = {"positions": {"MINT": {"name": "TEST", "chain": chain,
                                        "entry": 1.0, "peak": 1.0,
                                        "rungs_fired": [], "opened_at": time.time()}},
-               "day": time.strftime("%Y-%m-%d"), "trades_today": [],
+               "day": ft._bot_today_str(), "trades_today": [],
                "trades_this_hour": [], "realized_sol": 0.0}
     t.lock = threading.RLock()
     t.save = lambda: None
@@ -86,7 +86,7 @@ def test_manage_without_cached_fx_does_not_fetch(tmp_path):
     t.state_path = str(tmp_path / "state.json")
     t.state = {"positions": {"M": {"name": "M", "entry": 1, "peak": 1,
                                     "rungs_fired": []}},
-               "day": time.strftime("%Y-%m-%d"), "trades_today": [],
+               "day": ft._bot_today_str(), "trades_today": [],
                "trades_this_hour": [], "realized_sol": 0}
     t.lock = threading.RLock()
     t.save = lambda: None

@@ -3,6 +3,41 @@
 Every behavior change, with the evidence that motivated it. This is the
 paper-validation record: nothing here touches real money (dry_run=true).
 
+## 2026-09-29 — 6h loop Track A: bot calendar day pinned to America/New_York (shipped)
+- `fomo_trader.py`: new `DAY_TZ = ZoneInfo("America/New_York")` and
+  `_bot_today_str()`; both the state-load fallback and `_roll_day` use it
+  instead of host-local `time.strftime("%Y-%m-%d")`. `money.py` never reads
+  the day string (it only snapshots `day_start_bankroll_usd` from
+  `_roll_day`), so it is unchanged.
+- Why: the VM's host TZ flipped across restarts (2026-09-28/29). A flip
+  changes the host-local day string, so `_roll_day` silently reset
+  `trades_today`, `realized_*`, and the day-start bankroll mid-session,
+  disarming the kill switch and daily trade cap. No threshold changed; this
+  only stabilizes the day boundary.
+- Legacy `state.json` day strings self-heal on the next roll check (at most
+  one benign extra roll); no migration.
+- Tests: 12 new in `tests/test_day_tz_2026_09_29.py` (TZ=UTC/Kiritimati
+  flips, no reset on pure flip, reset on real NY date change, legacy
+  self-heal). Three existing fixtures (`test_trackA_robustness`,
+  `test_round4`, `test_z4_capture`) now seed `day` via `_bot_today_str()`.
+  Full suite: **720 passed, 0 failed** (venv pytest; also 720/720 under
+  `TZ=Pacific/Kiritimati`). dry_run untouched (still true).
+
+## 2026-09-29 — 6h loop: journal pool_created_at learns ISO-8601 (instrumentation only, shipped)
+- `journal.pool_created_at()` now parses ISO-8601 strings (GeckoTerminal
+  `created_at`, e.g. `2026-09-28T16:25:16Z`) into epoch seconds via
+  `datetime.fromisoformat`; naive strings (no tz) and unparseable values
+  still journal null, never crash. Numeric ms/seconds handling unchanged.
+- Why: the deep-research lane found pool_created_at null on 100% of
+  journaled candidates, blocking its F2 pool-age gate validation; the
+  iter-2 patch was drafted and self-tested (6/6) but never applied.
+- Guarantees unchanged: journaling never raises, never mutates inputs,
+  never feeds decisions; `STRATEGY_VERSION` stays `"1"` (instrumentation
+  only, no decision-behavior change).
+- 5 new tests in `tests/test_fixup_2026_09_28.py` (zulu, offset, key
+  priority, bad/naive/null safety, version-not-bumped). Full suite:
+  **703 passed, 0 failed** (venv pytest, coordinator shell).
+
 ## 2026-09-28 — Follow-up fix: research instrumentation + allocator back to shadow + positive-slip veto (shipped)
 Three changes from the deep-research pass, all paper-only (dry_run=true
 intact). Full suite: 698 passed, 0 failed (venv pytest, coordinator shell).
@@ -836,3 +871,15 @@ smaller and less frequent. Expectancy is still unproven at 19 trades.
 - Applied `hunter.min_buy_sell_ratio`: 1.5 -> 2.0
 - Rationale: raise hunter.min_buy_sell_ratio 1.5 -> 2.0 (geckoterminal-sourced: 153 trades, -0.437174 SOL - tighten buy pressure requirement)
 - Context: 157 closed trades, PF 0.49. Auto-applied by the daily self-improvement loop (paper mode only).
+
+## 2026-09-29 12:30 EDT - R9: ts_epoch on trades.jsonl records (deep-improvement loop iter-6)
+- Instrumentation only, zero strategy-behavior change (validation-lane PASS,
+  iter-5): entry records (SOL + BSC sites) and close records in trades.jsonl
+  now carry `ts_epoch` (epoch seconds at write time). candidates.jsonl
+  already had ts_epoch (committed in journal.py).
+- Motivation: 12 close rows have impossible holds from mixed-zone `ts`
+  strings; ts_epoch restores trustworthy hour/hold/ts-split analysis.
+- Additive field: no strategy logic, risk math, guard, or cap reads it.
+  Tests: tests/test_r9_ts_epoch.py (5 tests: all 3 write sites stamp it,
+  finalize_entry_record passthrough, no strategy consumption, record shape
+  unchanged).

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from analysis.replay import load_journal
-from fomo_trader import ApiThrottled, DexScreenerSource, Hunter, SOL_MINT, Trader, to_f
+from fomo_trader import ApiThrottled, DexScreenerSource, Hunter, SOL_MINT, Trader, _bot_today_str, to_f
 
 
 CFG = {"hunter": {"solana_pages_trending": 1, "solana_pages_new": 0,
@@ -52,7 +52,7 @@ def bare_trader():
     t.cfg = CFG
     t.lock = threading.RLock()
     t.state = {"positions": {}, "cooldown": {}, "trades_today": [],
-               "trades_this_hour": [], "day": time.strftime("%Y-%m-%d"),
+               "trades_this_hour": [], "day": _bot_today_str(),
                "realized_sol": 0.0}
     return t
 

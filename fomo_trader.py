@@ -36,6 +36,8 @@ import time
 import traceback
 import requests
 from collections import deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import allocator
 import journal
@@ -67,6 +69,17 @@ ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string(
     "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 GT_BASE = "https://api.geckoterminal.com/api/v2"
 JUP_BASE = "https://lite-api.jup.ag/swap/v1"  # free tier
+# The bot's calendar day (kill switch, daily trade cap, day-start bankroll
+# snapshot) is pinned to one fixed tz. Host-local time is unsafe: the host TZ
+# has flipped across restarts, which changes the day string and silently
+# resets trades_today / realized_* mid-session, disarming the daily caps.
+# A state.json written with the old host-local day string self-heals on the
+# next roll check (at most one benign extra roll); no migration needed.
+DAY_TZ = ZoneInfo("America/New_York")  # fixed bot-day tz; NEVER host-local
+
+
+def _bot_today_str():
+    return datetime.now(DAY_TZ).strftime("%Y-%m-%d")
 
 
 def log(msg):
@@ -1189,7 +1202,7 @@ class Trader:
                 % (type(e).__name__, e))
             self.state = {"positions": {}, "cooldown": {}, "trades_today": [],
                           "trades_this_hour": [],
-                          "day": time.strftime("%Y-%m-%d"), "realized_sol": 0.0,
+                          "day": _bot_today_str(), "realized_sol": 0.0,
                           "realized_bnb": 0.0, "realized_usd": 0.0}
         self._roll_day()
         # Paper bankroll: seeded once from the journal's all-time P&L.
@@ -1214,7 +1227,7 @@ class Trader:
 
     def _roll_day(self):
         with self.lock:
-            today = time.strftime("%Y-%m-%d")
+            today = _bot_today_str()
             if self.state.get("day") != today:
                 self.state.update({"day": today, "trades_today": [],
                                    "realized_sol": 0.0, "realized_bnb": 0.0,
@@ -1998,7 +2011,8 @@ class Trader:
                 self.state["positions"][mint].update(enrichment)
                 self.save()
             self._journal(journal.finalize_entry_record({
-                "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "type": "entry",
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "ts_epoch": time.time(),
+                "type": "entry",
                 "mint": mint, "name": name, "entry": entry,
                 "buy_sol": buy_sol, "buy_sig": sig,
                 "sol_usd": native_usd,
@@ -2181,7 +2195,8 @@ class Trader:
                 self.state["positions"][mint].update(enrichment)
                 self.save()
             self._journal(journal.finalize_entry_record({
-                "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "type": "entry",
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "ts_epoch": time.time(),
+                "type": "entry",
                 "mint": mint, "name": name, "chain": "bsc",
                 "entry": entry, "buy_sol": buy_bnb, "buy_sig": sig,
                 "sol_usd": native_usd,
@@ -2653,7 +2668,8 @@ class Trader:
                 money.apply_close(self.state, realized_usd)
                 self.save()
         unit = "BNB" if chain == "bsc" else "SOL"
-        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "type": "close",
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "ts_epoch": time.time(),
+               "type": "close",
                "mint": mint, "name": pos.get("name"), "chain": chain,
                "entry": entry, "peak": pos.get("peak"), "exit": exit_px,
                "buy_sol": buy, "rungs": rungs, "reason": reason,

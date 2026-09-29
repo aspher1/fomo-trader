@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from analysis import replay
-from fomo_trader import Trader
+from fomo_trader import Trader, _bot_today_str
 
 
 def paper_trader(tmp_path):
@@ -18,7 +18,7 @@ def paper_trader(tmp_path):
     trader.dry_run = True
     trader.state_path = str(tmp_path / "state.json")
     trader.state = {"positions": {}, "cooldown": {}, "trades_today": [],
-                    "trades_this_hour": [], "day": time.strftime("%Y-%m-%d"),
+                    "trades_this_hour": [], "day": _bot_today_str(),
                     "realized_sol": 0, "realized_bnb": 0,
                     "realized_usd": 0}
     trader.lock = threading.RLock()
