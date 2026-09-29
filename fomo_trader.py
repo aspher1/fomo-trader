@@ -1178,7 +1178,15 @@ class Trader:
             log("BSC key not configured - live BSC swaps need "
                 "wallets.bsc_key_file; paper BSC trading enabled")
         self._bscswap = None
-        self._bsc_down = False
+        # BSC reconnect backoff: a failed BscSwap construction no longer
+        # latches BSC off forever. _bsc_retry_at is the next epoch time a
+        # (re)connect may be attempted; _bsc_backoff_s doubles per
+        # consecutive failure (60s -> 30min cap) and resets on success.
+        # _bsc_down_logged rate-limits the "unavailable" log to one line
+        # per retry window so frequent entry attempts don't spam the log.
+        self._bsc_retry_at = 0.0
+        self._bsc_backoff_s = 60.0
+        self._bsc_down_logged = False
         self.dry_run = cfg.get("dry_run", True)
         self.decimals_cache = {}
         self.lock = threading.RLock()
@@ -1390,18 +1398,29 @@ class Trader:
     def bscswap(self):
         """Lazy PancakeSwap client. Keyless quotes work without a key file;
         the key is only loaded for live (non-dry-run) swaps. Returns None
-        (and logs once) when BSC RPCs are unreachable - SOL trading is
-        never affected."""
-        if self._bscswap is None and not self._bsc_down:
+        when BSC RPCs are unreachable - SOL trading is never affected.
+        A failed construction retries with backoff (60s, doubling, 30min
+        cap) instead of latching BSC off until the next restart."""
+        if self._bscswap is None:
+            now = time.time()
+            if now < self._bsc_retry_at:
+                return None
+            self._bsc_down_logged = False  # new window: one log line allowed
             try:
                 from bsc_swap import BscSwap
                 key_file = ((self.cfg.get("wallets", {}) or {})
                             .get("bsc_key_file") or "").strip() or None
                 self._bscswap = BscSwap(self.cfg.get("bsc_rpc_urls"),
                                         key_file=key_file)
+                self._bsc_backoff_s = 60.0
             except Exception as e:
-                self._bsc_down = True
-                log("BSC unavailable, BSC entries disabled: %s" % e)
+                self._bsc_retry_at = now + self._bsc_backoff_s
+                self._bsc_backoff_s = min(self._bsc_backoff_s * 2, 1800.0)
+                if not self._bsc_down_logged:
+                    self._bsc_down_logged = True
+                    log("BSC unavailable, BSC entries disabled "
+                        "(retry in %ds): %s"
+                        % (int(self._bsc_retry_at - now), e))
         return self._bscswap
 
     def bnb_usd(self):

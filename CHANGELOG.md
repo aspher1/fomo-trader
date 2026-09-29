@@ -3,6 +3,19 @@
 Every behavior change, with the evidence that motivated it. This is the
 paper-validation record: nothing here touches real money (dry_run=true).
 
+## 2026-09-29 — session iter3: BSC client reconnects with backoff (robustness, shipped)
+- `fomo_trader.py` `bscswap()`: a failed `BscSwap` construction no longer
+  latches BSC off until restart. It now schedules a retry with exponential
+  backoff (60s, doubling, 30min cap; reset on success) and logs at most one
+  "BSC unavailable" line per retry window.
+- Why: a transient RPC outage at startup silently disabled ALL BSC entries
+  (where ~all entries happen) with no recovery path.
+- Tests: 5 new in `tests/test_bsc_reconnect_2026_09_29.py` (fake clock +
+  fake BscSwap: retry scheduled, no re-attempt inside window, success resets
+  backoff, doubling + 1800s cap, one log line per window). Full suite:
+  **779 passed, 0 failed** (venv pytest, coordinator shell). dry_run
+  untouched (still true).
+
 ## 2026-09-29 — iteration 2: BSC LP-lock/burn verification screen (mechanism only, default OFF)
 - **Mechanism only. Default OFF. No live behavior change.** Enabling
   `hunter.entry.verify_lp_lock` requires prospective validation first; the
