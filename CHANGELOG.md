@@ -3,6 +3,36 @@
 Every behavior change, with the evidence that motivated it. This is the
 paper-validation record: nothing here touches real money (dry_run=true).
 
+## 2026-09-29 — iteration 2: BSC LP-lock/burn verification screen (mechanism only, default OFF)
+- **Mechanism only. Default OFF. No live behavior change.** Enabling
+  `hunter.entry.verify_lp_lock` requires prospective validation first; the
+  flag is deliberately absent from config.json (absent = False).
+- `bsc_swap.py`: `BscSwap.lp_lock_status(token, threshold_pct=50.0)`.
+  Read-only, sequential eth_calls on the existing `self.w3`: factory
+  `getPair(token, WBNB)` → pair `totalSupply()` → `balanceOf(0x…dEaD)`.
+  Returns `no_pair` / `burned` (burn ≥ threshold) / `unlocked` / `unknown`
+  (any exception; never raises). No retries, 8s budget across the calls,
+  no key (`_ensure_key` never called). `PANCAKE_V2_FACTORY =
+  0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73`, verified as the mainnet V2
+  router's own `factory()` on two BSC RPCs.
+- `fomo_trader.py` `enter_bsc`: after the honeypot check, only when the flag
+  is true: `unlocked` → `LP-LOCK SKIP` + `lp_lock_skip` event in
+  candidates.jsonl, no entry; `no_pair` / `unknown` fail open (logged as
+  `LP-LOCK GAP`). Threshold: `hunter.entry.lp_burn_threshold_pct` (default 50).
+- Journal (additive, flag on only): `lp_lock_verdict` and `lp_lock_burn_pct`
+  on the entry record (null unless measured). Named `lp_lock_burn_pct`, not
+  `lp_burn_pct`, because `lp_burn_pct` already carries scanner LP evidence
+  (read by replay) and must not be overwritten.
+- Why: ~78% of lifetime BSC losses are one-tick LP-pull wipes; BSC has no
+  LP screen today. This adds the measurement so a future gate can be
+  validated on journaled verdicts before it ever filters an entry.
+- Tests: 45 new in `tests/test_lp_lock_2026_09_29.py` (mocked w3, sockets
+  blocked). With the flag off, the screen is never called, no RPC traffic
+  is made, and entry/position output is byte-identical to the golden entry.
+  With the flag on, `unlocked` skips and every inconclusive result enters.
+  Full suite: **774 passed, 0 failed** (venv pytest, two consecutive runs).
+  dry_run untouched (still true).
+
 ## 2026-09-29 — iteration 1: dump cooldown armed by explicit flag (robustness, shipped)
 - `fomo_trader.py`: `close_trade(..., dump_exit=False)`. The exit path sets
   `dump_exit=True` exactly when it takes the venue-dump or dump-detector

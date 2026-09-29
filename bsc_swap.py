@@ -17,8 +17,15 @@ import time
 from web3 import Web3
 
 PANCAKE_V2_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+# == PANCAKE_V2_ROUTER.factory() on BSC mainnet
+PANCAKE_V2_FACTORY = "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73"
 WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 BSC_CHAIN_ID = 56
+LP_BURN_THRESHOLD_PCT = 50.0
+# Wall-clock budget across the sequential LP-lock reads; no retries.
+LP_LOCK_BUDGET_SEC = 8.0
 
 DEFAULT_BSC_RPCS = [
     "https://bsc-dataseed.binance.org",
@@ -59,6 +66,21 @@ _ERC20_ABI = [
      "inputs": [{"name": "spender", "type": "address"},
                 {"name": "amount", "type": "uint256"}],
      "outputs": [{"name": "", "type": "bool"}]},
+]
+
+_FACTORY_ABI = [
+    {"name": "getPair", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "tokenA", "type": "address"},
+                {"name": "tokenB", "type": "address"}],
+     "outputs": [{"name": "pair", "type": "address"}]},
+]
+
+_PAIR_ABI = [
+    {"name": "totalSupply", "type": "function", "stateMutability": "view",
+     "inputs": [], "outputs": [{"name": "", "type": "uint256"}]},
+    {"name": "balanceOf", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "owner", "type": "address"}],
+     "outputs": [{"name": "", "type": "uint256"}]},
 ]
 
 
@@ -159,6 +181,53 @@ class BscSwap:
         if rt_pct < min_roundtrip_pct:
             return False, "round trip only %.1f%% (honeypot/tax)" % rt_pct
         return True, "round trip %.1f%%" % rt_pct
+
+    def lp_lock_status(self, token, threshold_pct=LP_BURN_THRESHOLD_PCT):
+        """Share of the token/WBNB PancakeSwap V2 LP sent to 0x...dEaD.
+
+        Read-only eth_calls on self.w3, sequential, no retries, no key.
+        Returns {"pair": None, "verdict": "no_pair"},
+        {"pair", "burn_pct", "verdict": "burned"|"unlocked"}, or
+        {"verdict": "unknown", "error": str}. Never raises.
+        """
+        try:
+            t0 = time.time()
+
+            def _budget():
+                if time.time() - t0 > LP_LOCK_BUDGET_SEC:
+                    raise TimeoutError("lp lock budget %.0fs exceeded"
+                                       % LP_LOCK_BUDGET_SEC)
+
+            factory = self.w3.eth.contract(
+                address=Web3.to_checksum_address(PANCAKE_V2_FACTORY),
+                abi=_FACTORY_ABI)
+            pair = factory.functions.getPair(
+                Web3.to_checksum_address(token),
+                Web3.to_checksum_address(WBNB)).call()
+            if not pair or str(pair).lower() == ZERO_ADDRESS:
+                return {"pair": None, "verdict": "no_pair"}
+            pair = Web3.to_checksum_address(pair)
+            _budget()
+            lp = self.w3.eth.contract(address=pair, abi=_PAIR_ABI)
+            total = lp.functions.totalSupply().call()
+            _budget()
+            dead = lp.functions.balanceOf(
+                Web3.to_checksum_address(DEAD_ADDRESS)).call()
+            if type(total) is not int or type(dead) is not int:
+                raise ValueError("non-integer LP supply/balance")
+            if total <= 0 or dead < 0 or dead > total:
+                raise ValueError("implausible LP supply %s / dead %s"
+                                 % (total, dead))
+            burn_pct = dead / total * 100.0
+            return {"pair": pair, "burn_pct": burn_pct,
+                    "verdict": ("burned" if burn_pct >= float(threshold_pct)
+                                else "unlocked")}
+        except Exception as e:
+            try:
+                err = "%s: %s" % (type(e).__name__, str(e)[:120])
+            except Exception:
+                err = "unprintable error"
+            return {"verdict": "unknown", "error": err}
 
     # -- execution --
     def execute_buy(self, token, bnb_wei, slippage_bps=500, dry_run=True):

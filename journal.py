@@ -220,6 +220,53 @@ def sanitize_veto(signal, entry_native, native_usd, slip, chain):
                 "journal_error": True}
 
 
+def lp_lock_fields(status):
+    """{"lp_lock_verdict", "lp_lock_burn_pct"} from a
+    BscSwap.lp_lock_status() result; burn pct is None unless measured.
+    Distinct from the scanner-sourced "lp_burn_pct", which it never touches.
+    Never raises."""
+    try:
+        st = status if isinstance(status, dict) else {}
+        verdict = st.get("verdict")
+        return {"lp_lock_verdict": verdict if isinstance(verdict, str)
+                else "unknown",
+                "lp_lock_burn_pct": _num(st.get("burn_pct"))}
+    except Exception:
+        return {"lp_lock_verdict": "unknown", "lp_lock_burn_pct": None}
+
+
+def sanitize_lp_lock_skip(signal, status):
+    """Build an lp_lock_skip event record for an entry skipped because the
+    pair's LP is not burned. Never raises."""
+    try:
+        s = signal or {}
+        st = status if isinstance(status, dict) else {}
+        rec = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ts_epoch": time.time(),
+            "event": "lp_lock_skip",
+            "strategy_version": STRATEGY_VERSION,
+            "name": s.get("name"),
+            "mint": s.get("mint"),
+            "pool": s.get("pool"),
+            "chain": "bsc",
+            "lp_pair": st.get("pair"),
+            "signal_price_usd": _num(s.get("signal_price_usd")),
+            "liquidity_usd": _num(s.get("liquidity_usd")),
+            "signal_gain_pct": _num(s.get("m15_gain_pct")),
+            "pool_created_at": pool_created_at(s),
+            "source": s.get("source"),
+            "window": s.get("window_label"),
+        }
+        rec.update(lp_lock_fields(st))
+        return rec
+    except Exception:
+        return {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "event": "lp_lock_skip",
+                "strategy_version": STRATEGY_VERSION,
+                "journal_error": True}
+
+
 def finalize_entry_record(rec, signal):
     """Add instrumentation fields to an entry journal record.
 

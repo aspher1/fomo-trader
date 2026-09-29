@@ -2072,9 +2072,35 @@ class Trader:
                                        in_amount_raw=amount_wei,
                                        screen_reason=why)
                 return
+            ecfg = self.cfg["hunter"].get("entry", {})
+            # LP burn screen: default OFF (hunter.entry.verify_lp_lock).
+            # Only a measured "unlocked" skips; "no_pair"/"unknown" fail open.
+            lp_fields = None
+            if ecfg.get("verify_lp_lock", False):
+                try:
+                    st = bsc.lp_lock_status(
+                        mint, ecfg.get("lp_burn_threshold_pct", 50.0))
+                except Exception as e:
+                    st = {"verdict": "unknown", "error": type(e).__name__}
+                if not isinstance(st, dict):
+                    st = {"verdict": "unknown", "error": "bad lp status"}
+                lp_fields = journal.lp_lock_fields(st)
+                if st.get("verdict") == "unlocked":
+                    log("LP-LOCK SKIP %s: LP burn %.1f%% (pair %s)"
+                        % (name, st.get("burn_pct") or 0.0, st.get("pair")))
+                    try:
+                        journal.journal_event(
+                            os.path.dirname(os.path.abspath(self.state_path)),
+                            journal.sanitize_lp_lock_skip(signal, st))
+                    except Exception:
+                        pass
+                    return
+                if st.get("verdict") != "burned":
+                    log("LP-LOCK GAP %s: verdict %s%s, proceeding (fail open)"
+                        % (name, st.get("verdict"),
+                           (" (%s)" % st["error"]) if st.get("error") else ""))
             # anti-top: wait for a dip off the signal price (disabled when
             # entry.pullback_pct is 0, i.e. immediate market entry)
-            ecfg = self.cfg["hunter"].get("entry", {})
             pb_pct = ecfg.get("pullback_pct", 0) or 0
             wait = ecfg.get("max_wait_sec", 0) or 0
             ref = None
@@ -2195,6 +2221,7 @@ class Trader:
                 self.state["positions"][mint].update(enrichment)
                 self.save()
             self._journal(journal.finalize_entry_record({
+                **(lp_fields or {}),
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "ts_epoch": time.time(),
                 "type": "entry",
                 "mint": mint, "name": name, "chain": "bsc",
