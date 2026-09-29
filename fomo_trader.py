@@ -2485,13 +2485,16 @@ class Trader:
                 log("SHADOW DUMP %s: %s" % (pos["name"], shadow))
         # dump detector first: violent vertical drops exit NOW, before the
         # wider trailing stop even matters. This is the anti-rug reflex.
+        dump_exit = False
         if venue_dumped:
+            dump_exit = True
             reason = ("venue dump: DexScreener m5 %.1f%%, selling all"
                       % venue_m5)
             log("%s: VENUE DUMP DexScreener m5 %.1f%% <= %.0f%%, "
                 "selling all" % (pos["name"], venue_m5, vth))
             self.sell_pct_of_balance(mint, 100, "venue-dump")
         elif dumped:
+            dump_exit = True
             reason = ("dump detector -%.1f%% in %ss, selling all"
                       % (dump_drop, dump_win))
             log("%s: DUMP DETECTOR -%.1f%% in %ss, selling all"
@@ -2525,7 +2528,7 @@ class Trader:
         # after a full exit, check balance; if dust/zero, close position
         time.sleep(2)
         if self.token_balance_raw(mint) == 0:
-            self.close_trade(mint, pos, price, reason)
+            self.close_trade(mint, pos, price, reason, dump_exit=dump_exit)
             return True
         return False
 
@@ -2605,8 +2608,12 @@ class Trader:
         except Exception:
             return False
 
-    def close_trade(self, mint, pos, exit_price, reason):
-        """Pop a fully-exited position, compute exact realized P&L, journal it."""
+    def close_trade(self, mint, pos, exit_price, reason, dump_exit=False):
+        """Pop a fully-exited position, compute exact realized P&L, journal it.
+
+        dump_exit=True (dump detector / venue dump) arms the 24h per-mint
+        dump cooldown; `reason` is human-readable only and never parsed.
+        """
         buy = pos.get("buy_sol", 0)
         entry = pos.get("entry") or 0
         exit_px = exit_price or pos.get("peak") or entry
@@ -2645,8 +2652,7 @@ class Trader:
             realized = round(realized, 6)
         with self.lock:
             self.state["positions"].pop(mint, None)
-            if ("dump detector" in reason.lower()
-                    or "venue dump" in reason.lower()):
+            if dump_exit:
                 self.state.setdefault("dump_cooldown", {})[mint] = time.time()
             # buy_sol/sold_sol hold NATIVE amounts (SOL or BNB per chain).
             if (pos.get("chain") or "solana") == "bsc":

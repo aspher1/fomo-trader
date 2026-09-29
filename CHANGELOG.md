@@ -3,6 +3,22 @@
 Every behavior change, with the evidence that motivated it. This is the
 paper-validation record: nothing here touches real money (dry_run=true).
 
+## 2026-09-29 — iteration 1: dump cooldown armed by explicit flag (robustness, shipped)
+- `fomo_trader.py`: `close_trade(..., dump_exit=False)`. The exit path sets
+  `dump_exit=True` exactly when it takes the venue-dump or dump-detector
+  branch and passes it through; `close_trade` arms `dump_cooldown[mint]`
+  from that flag instead of substring-matching `reason`.
+- Why: arming depended on the free-text reason containing "dump detector" /
+  "venue dump"; rewording either string would have silently disabled the
+  24h cooldown. Same exits arm, same mints, same 24h window; reason strings
+  unchanged. No entry/exit/risk behavior change.
+- Tests: 9 new in `tests/test_dump_cooldown_flag_2026_09_29.py` (real
+  `_manage_once` path: dump detector and venue dump arm for 24h; trailing,
+  hard, stale, take-profit do not; reworded reasons still arm; text alone
+  never arms). `test_round4`'s two direct `close_trade` calls now pass
+  `dump_exit` explicitly. Full suite: **729 passed, 0 failed** (venv
+  pytest, two consecutive runs). dry_run untouched (still true).
+
 ## 2026-09-29 — 6h loop Track A: bot calendar day pinned to America/New_York (shipped)
 - `fomo_trader.py`: new `DAY_TZ = ZoneInfo("America/New_York")` and
   `_bot_today_str()`; both the state-load fallback and `_roll_day` use it

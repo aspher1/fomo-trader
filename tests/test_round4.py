@@ -36,7 +36,8 @@ def test_dump_cooldown_veto_expiry_and_persistence(tmp_path):
          patch.object(trader, "native_usd", return_value=100), \
          patch.object(trader, "sol_usd", return_value=100), \
          patch.object(trader, "_journal"):
-        trader.close_trade("mint", pos, .8, "dump detector -20% in 60s")
+        trader.close_trade("mint", pos, .8, "dump detector -20% in 60s",
+                           dump_exit=True)
         saved = json.loads((tmp_path / "state.json").read_text())
         assert saved["dump_cooldown"]["mint"] > 0
         assert not trader.guardrails_ok(signal)
@@ -54,12 +55,13 @@ def test_venue_dump_records_but_other_close_does_not(tmp_path):
     with patch.object(trader, "native_usd", return_value=100), \
          patch.object(trader, "sol_usd", return_value=100), \
          patch.object(trader, "_journal"):
-        for mint, reason in (("venue", "venue dump: m5 -100%"),
-                             ("normal", "trailing stop -25% from peak")):
+        for mint, reason, dump_exit in (
+                ("venue", "venue dump: m5 -100%", True),
+                ("normal", "trailing stop -25% from peak", False)):
             pos = {"name": mint, "entry": 1, "peak": 1, "buy_sol": .06,
                    "rungs_fired": []}
             trader.state["positions"][mint] = pos
-            trader.close_trade(mint, pos, .9, reason)
+            trader.close_trade(mint, pos, .9, reason, dump_exit=dump_exit)
     saved = json.loads((tmp_path / "state.json").read_text())
     assert "venue" in saved["dump_cooldown"]
     assert "normal" not in saved["dump_cooldown"]
