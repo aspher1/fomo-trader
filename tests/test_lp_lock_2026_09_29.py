@@ -369,3 +369,44 @@ def test_journal_helpers_never_raise(bad):
     assert f["lp_lock_burn_pct"] is None
     ev = journal.sanitize_lp_lock_skip({"name": "X"}, bad)
     assert ev["event"] == "lp_lock_skip"
+
+
+# -- "measure" mode: journal the verdict, never skip ------------------------
+
+def test_measure_mode_unlocked_journals_and_enters(tmp_path):
+    bsc = RecordingBsc(status={"pair": PAIR, "burn_pct": 3.5,
+                               "verdict": "unlocked"})
+    with patch("fomo_trader.log") as lg:
+        t, lines, events = run_bsc_entry(tmp_path, bsc,
+                                         {"verify_lp_lock": "measure"})
+    assert bsc.lp_calls == [("0xMINT", 50.0)]
+    assert "0xMINT" in t.state["positions"]
+    assert len(lines) == 1 and events == []  # no skip event
+    rec = json.loads(lines[0])
+    assert rec.pop("lp_lock_verdict") == "unlocked"
+    assert rec.pop("lp_lock_burn_pct") == 3.5
+    assert rec == golden_bsc()
+    logged = " ".join(str(c.args[0]) for c in lg.call_args_list)
+    assert "LP-LOCK MEASURE" in logged and "LP-LOCK SKIP" not in logged
+
+
+def test_measure_mode_burned_journals_burned(tmp_path):
+    bsc = RecordingBsc(status={"pair": PAIR, "burn_pct": 99.0,
+                               "verdict": "burned"})
+    t, lines, events = run_bsc_entry(tmp_path, bsc,
+                                     {"verify_lp_lock": "measure"})
+    assert "0xMINT" in t.state["positions"] and events == []
+    rec = json.loads(lines[0])
+    assert rec["lp_lock_verdict"] == "burned"
+    assert rec["lp_lock_burn_pct"] == 99.0
+
+
+@pytest.mark.parametrize("entry_cfg", [{"verify_lp_lock": "off"},
+                                       {"verify_lp_lock": ""}])
+def test_measure_off_strings_never_call_screen(tmp_path, entry_cfg):
+    bsc = RecordingBsc(status={"pair": PAIR, "burn_pct": 1.0,
+                               "verdict": "unlocked"})
+    t, lines, events = run_bsc_entry(tmp_path, bsc, entry_cfg)
+    assert bsc.lp_calls == []
+    assert lines == [z3.GOLDEN_ENTRY["bsc"]]
+    assert events == []

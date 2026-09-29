@@ -2092,10 +2092,15 @@ class Trader:
                                        screen_reason=why)
                 return
             ecfg = self.cfg["hunter"].get("entry", {})
-            # LP burn screen: default OFF (hunter.entry.verify_lp_lock).
+            # LP burn screen (hunter.entry.verify_lp_lock): False/"off"
+            # (default) = screen disabled, no RPC traffic; "measure" =
+            # run the check and journal the verdict but never skip (builds
+            # the prospective dataset needed to validate the gate);
+            # True/"enforce" = skip the entry on a measured "unlocked".
             # Only a measured "unlocked" skips; "no_pair"/"unknown" fail open.
             lp_fields = None
-            if ecfg.get("verify_lp_lock", False):
+            lp_mode = ecfg.get("verify_lp_lock", False)
+            if lp_mode and lp_mode != "off":
                 try:
                     st = bsc.lp_lock_status(
                         mint, ecfg.get("lp_burn_threshold_pct", 50.0))
@@ -2104,7 +2109,7 @@ class Trader:
                 if not isinstance(st, dict):
                     st = {"verdict": "unknown", "error": "bad lp status"}
                 lp_fields = journal.lp_lock_fields(st)
-                if st.get("verdict") == "unlocked":
+                if st.get("verdict") == "unlocked" and lp_mode in (True, "enforce"):
                     log("LP-LOCK SKIP %s: LP burn %.1f%% (pair %s)"
                         % (name, st.get("burn_pct") or 0.0, st.get("pair")))
                     try:
@@ -2115,9 +2120,15 @@ class Trader:
                         pass
                     return
                 if st.get("verdict") != "burned":
-                    log("LP-LOCK GAP %s: verdict %s%s, proceeding (fail open)"
-                        % (name, st.get("verdict"),
-                           (" (%s)" % st["error"]) if st.get("error") else ""))
+                    if lp_mode == "measure":
+                        log("LP-LOCK MEASURE %s: verdict %s (burn %.1f%%), "
+                            "journaled, entry proceeds"
+                            % (name, st.get("verdict"),
+                               st.get("burn_pct") or 0.0))
+                    else:
+                        log("LP-LOCK GAP %s: verdict %s%s, proceeding (fail open)"
+                            % (name, st.get("verdict"),
+                               (" (%s)" % st["error"]) if st.get("error") else ""))
             # anti-top: wait for a dip off the signal price (disabled when
             # entry.pullback_pct is 0, i.e. immediate market entry)
             pb_pct = ecfg.get("pullback_pct", 0) or 0

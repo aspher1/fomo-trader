@@ -1,5 +1,19 @@
 # FOMO Trader CHANGELOG
 
+## 2026-09-29 — session iter4: LP-lock screen gains "measure" mode (instrumentation, shipped)
+- `hunter.entry.verify_lp_lock` now takes modes: False/"off" (default,
+  screen disabled, zero RPC traffic), "measure" (run the check, journal
+  `lp_lock_verdict`/`lp_lock_burn_pct` on the entry record, never skip),
+  True/"enforce" (skip the entry on a measured "unlocked").
+- Why: enforcing the LP-burn gate without prospective data would be an
+  unvalidated strategy change. "measure" accumulates the verdict/burn-pct
+  dataset on real would-be entries so the gate can pass the OOS walk-forward
+  bar (≥30 OOS trades, ≥60% retention, 3x-fee stress) before any veto goes
+  live. Adds a distinct `LP-LOCK MEASURE` log line.
+- Tests: 4 new (measure+unlocked journals and enters, measure+burned,
+  "off"/"" never call the screen). Full suite: **783 passed, 0 failed**
+  (venv pytest, coordinator shell). dry_run untouched (still true).
+
 Every behavior change, with the evidence that motivated it. This is the
 paper-validation record: nothing here touches real money (dry_run=true).
 
