@@ -26,6 +26,7 @@ import http.client
 import json
 import math
 import os
+import queue
 import random
 import signal
 import socket
@@ -35,6 +36,11 @@ import time
 import traceback
 import requests
 from collections import deque
+
+import allocator
+import journal
+import money
+from shadow_dump import evaluate as evaluate_shadow_dump
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -91,7 +97,8 @@ def http_post(url, payload, timeout=30):
 
 def to_f(x):
     try:
-        return float(x)
+        value = float(x)
+        return value if math.isfinite(value) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -147,6 +154,304 @@ def entry_evidence(signal, entry, native_usd, holder=None, commit_ts=None):
         "m15_volume_usd": signal.get("m15_volume_usd"),
         "mcap_usd": signal.get("mcap_usd"),
     }
+
+
+def wipe_drift_cap_native(signal, entry_native, native_usd, cfg_buy, buy_native):
+    """Shrink a positive-drift ticket to the allocator's 0.5x floor."""
+    try:
+        sig_usd = float(signal.get("signal_price_usd") or 0)
+    except (TypeError, ValueError, OverflowError):
+        sig_usd = 0.0
+    slip = (entry_native * native_usd / sig_usd - 1
+            if sig_usd > 0 and entry_native and native_usd else None)
+    if slip is not None and slip > 0:
+        floor_native = (cfg_buy or 0) * 0.5
+        if floor_native > 0 and buy_native > floor_native:
+            return floor_native, True, slip
+    return buy_native, False, slip
+
+
+def slip_from_signal(signal, entry_native, native_usd):
+    """Signed fractional slip of the entry fill vs the scanner signal price.
+
+    (entry_native * native_usd / signal_price_usd - 1); > 0 means we are
+    buying above the signal print (chasing the top). Returns None when the
+    slip cannot be measured (missing signal price or rate). Pure, no I/O.
+    """
+    try:
+        sig_usd = float(signal.get("signal_price_usd") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        if sig_usd > 0 and entry_native and native_usd:
+            slip = float(entry_native) * float(native_usd) / sig_usd - 1
+            return slip if math.isfinite(slip) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return None
+
+
+RESEARCH_OFF = (False, None, False)
+CAPTURE_OFF = (False, False)
+QUOTE_PATH_MAX_TICKS = 5000
+QUOTE_PATH_MAX_BYTES = 1024 * 1024
+_failed_quotes_lock = threading.Lock()
+_quote_paths_lock = threading.Lock()
+_quote_path_counts = {}
+RESEARCH_QUESTIONS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "research_questions.json")
+_research_warned = set()
+_research_registry = {"key": None, "ids": frozenset()}
+
+
+def _research_warn(key, msg):
+    """Log a research-mode fallback once per distinct cause."""
+    if key not in _research_warned:
+        _research_warned.add(key)
+        log(msg)
+
+
+def research_settings(cfg):
+    """(tag_trades, question_id, dashboard) from the optional `research`
+    config section. A missing section or enabled != true is all-off; any
+    malformed value fails safe to off with a one-time log line. Never raises."""
+    try:
+        sec = cfg.get("research") if isinstance(cfg, dict) else None
+        if sec is None:
+            return RESEARCH_OFF
+        if not isinstance(sec, dict):
+            _research_warn(("research", type(sec).__name__),
+                           "RESEARCH config ignored: `research` is %s, not an "
+                           "object; observation mode off" % type(sec).__name__)
+            return RESEARCH_OFF
+        flags = {}
+        for key in ("enabled", "tag_trades", "dashboard"):
+            value = sec.get(key)
+            if value is not None and not isinstance(value, bool):
+                shown = repr(value)[:60]
+                _research_warn((key, shown),
+                               "RESEARCH config: %s=%s is not true/false; "
+                               "treated as false" % (key, shown))
+            flags[key] = value is True
+            if key == "enabled" and not flags[key]:
+                return RESEARCH_OFF
+        qid = sec.get("question_id")
+        if isinstance(qid, str) and qid.strip():
+            qid = qid.strip()
+        else:
+            if qid is not None:
+                shown = repr(qid)[:60]
+                _research_warn(("question_id", shown),
+                               "RESEARCH config: question_id=%s is not a "
+                               "non-empty string; ignored" % shown)
+            qid = None
+        return (flags["tag_trades"], qid, flags["dashboard"])
+    except Exception as e:
+        _research_warn(("research", "error", type(e).__name__),
+                       "RESEARCH config unreadable (%s); observation mode off"
+                       % type(e).__name__)
+        return RESEARCH_OFF
+
+
+def capture_settings(cfg):
+    """Return the two opt-in capture flags; malformed settings fail closed."""
+    try:
+        sec = cfg.get("research") if isinstance(cfg, dict) else None
+        if sec is None:
+            return CAPTURE_OFF
+        if not isinstance(sec, dict):
+            _research_warn(("capture", "research", type(sec).__name__),
+                           "RESEARCH capture ignored: research is not an object")
+            return CAPTURE_OFF
+        enabled = sec.get("enabled")
+        if enabled is not True:
+            if enabled is not None and not isinstance(enabled, bool):
+                _research_warn(("capture", "enabled", repr(enabled)[:60]),
+                               "RESEARCH capture ignored: malformed enabled")
+            return CAPTURE_OFF
+        values = [sec.get(k) for k in ("capture_quote_path",
+                                       "capture_failed_quotes")]
+        for key, value in zip(("capture_quote_path", "capture_failed_quotes"),
+                              values):
+            if value is not None and not isinstance(value, bool):
+                _research_warn(("capture", key, repr(value)[:60]),
+                               "RESEARCH capture ignored: malformed %s" % key)
+                return CAPTURE_OFF
+        return tuple(value is True for value in values)
+    except Exception as e:
+        _research_warn(("capture", "error", type(e).__name__),
+                       "RESEARCH capture settings unreadable (%s)" % type(e).__name__)
+        return CAPTURE_OFF
+
+
+def _capture_mint(mint):
+    return "".join(c if c.isalnum() and c.isascii() else "_" for c in str(mint))[:128] or "unknown"
+
+
+def maybe_capture_quote_tick(trader_or_cfg, state_path, mint, chain,
+                             price_usd, liquidity_usd):
+    """Append an observed mark. A callable price defers native/USD conversion."""
+    try:
+        cfg = trader_or_cfg if isinstance(trader_or_cfg, dict) else trader_or_cfg.cfg
+        if not capture_settings(cfg)[0]:
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(state_path)),
+                            "quote_paths", _capture_mint(mint) + ".jsonl")
+        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "mint": mint,
+               "chain": chain,
+               "price_usd": price_usd() if callable(price_usd) else price_usd,
+               "liquidity_usd": liquidity_usd}
+        with _quote_paths_lock:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            count = _quote_path_counts.get(path)
+            if count is None:
+                if os.path.exists(path):
+                    with open(path) as f:
+                        count = sum(1 for _ in f)
+                else:
+                    count = 0
+            if count >= QUOTE_PATH_MAX_TICKS or size > QUOTE_PATH_MAX_BYTES:
+                _research_warn(("quote_cap", path),
+                               "RESEARCH quote path capped for %s" % mint)
+                return
+            line = json.dumps(row) + "\n"
+            if size + len(line.encode("utf-8")) > QUOTE_PATH_MAX_BYTES:
+                _research_warn(("quote_cap", path),
+                               "RESEARCH quote path capped for %s" % mint)
+                return
+            with open(path, "a") as f:
+                f.write(line)
+            _quote_path_counts[path] = count + 1
+    except Exception as e:
+        _research_warn(("quote_path", type(e).__name__),
+                       "RESEARCH quote path unavailable (%s)" % type(e).__name__)
+
+
+def maybe_capture_failed_quote(cfg, state_path, mint, chain, reason, econ_dict):
+    """Append a failed quote or guard decision without affecting trading."""
+    try:
+        if not capture_settings(cfg)[1]:
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(state_path)),
+                            "failed_quotes.jsonl")
+        row = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "mint": mint,
+               "chain": chain, "reason": reason}
+        if isinstance(econ_dict, dict):
+            row.update({k: v for k, v in econ_dict.items() if k not in row})
+        line = json.dumps(row) + "\n"
+        with _failed_quotes_lock:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a") as f:
+                f.write(line)
+    except Exception as e:
+        _research_warn(("failed_quote", type(e).__name__),
+                       "RESEARCH failed quote capture unavailable (%s)"
+                       % type(e).__name__)
+
+
+def _maybe_capture_failure(trader, signal, reason, **extra):
+    """Collect only already-known economics when failed-quote capture is on."""
+    try:
+        if not capture_settings(trader.cfg)[1]:
+            return
+        econ = {k: signal.get(k) for k in
+                ("name", "liquidity_usd", "signal_price_usd", "pool_url",
+                 "m15_gain_pct", "buy_sell_ratio")}
+        econ.update(extra)
+        maybe_capture_failed_quote(trader.cfg, trader.state_path,
+                                   signal.get("mint"),
+                                   signal.get("chain", "solana"), reason, econ)
+    except Exception as e:
+        _research_warn(("failure_site", type(e).__name__),
+                       "RESEARCH failed quote capture unavailable (%s)"
+                       % type(e).__name__)
+
+
+def registered_question_ids(path=None):
+    """Ids of `open` questions in research_questions.json, re-read only when
+    the file changes. Missing or corrupt registry -> empty (logged once)."""
+    path = path or RESEARCH_QUESTIONS_PATH
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        _research_warn(("registry", path, type(e).__name__),
+                       "RESEARCH registry %s unreadable (%s); trades tagged "
+                       "unregistered" % (path, type(e).__name__))
+        return frozenset()
+    key = (path, st.st_mtime_ns, st.st_size)
+    if _research_registry["key"] == key:
+        return _research_registry["ids"]
+    ids = frozenset()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        ids = frozenset(q["id"] for q in data["questions"]
+                        if isinstance(q, dict) and isinstance(q.get("id"), str)
+                        and q.get("status") == "open")
+    except Exception as e:
+        _research_warn(("registry", key, type(e).__name__),
+                       "RESEARCH registry %s corrupt (%s); trades tagged "
+                       "unregistered" % (path, type(e).__name__))
+    _research_registry.update(key=key, ids=ids)
+    return ids
+
+
+def maybe_tag_research(rec, cfg, pos=None):
+    """Observation mode: set rec["research_question"] when research.enabled
+    and research.tag_trades are both true; otherwise return rec untouched.
+    Entry sites tag the enrichment dict, so the journal record and the
+    position both carry it; the close site passes the position so its record
+    keeps the entry-time tag. Never raises."""
+    try:
+        tag, qid, _ = research_settings(cfg)
+        if not tag or not isinstance(rec, dict):
+            return rec
+        if isinstance(pos, dict):
+            q = pos.get("research_question")
+            rec["research_question"] = (q if isinstance(q, str) and q
+                                        else "unregistered")
+            return rec
+        if qid is None:
+            _research_warn(("question_id", "unset"),
+                           "RESEARCH tag_trades is on but no question_id is "
+                           "set; trades tagged unregistered")
+        elif qid not in registered_question_ids():
+            _research_warn(("question_id", "unregistered", qid),
+                           "RESEARCH question_id %r is not an open question in "
+                           "%s; trades tagged unregistered"
+                           % (qid, RESEARCH_QUESTIONS_PATH))
+            qid = None
+        rec["research_question"] = qid or "unregistered"
+        return rec
+    except Exception as e:
+        _research_warn(("tag", type(e).__name__),
+                       "RESEARCH tagging failed (%s); record left untagged"
+                       % type(e).__name__)
+        return rec
+
+
+def maybe_research_dashboard(cfg, state_path):
+    """After a close: refresh analysis/obs/kill_dashboard.json when
+    research.enabled and research.dashboard are both true. Off -> returns
+    None without importing anything. Failures are logged once, never raised."""
+    try:
+        if not research_settings(cfg)[2]:
+            return None
+        import obs_dashboard
+        dash = obs_dashboard.update(os.path.join(
+            os.path.dirname(os.path.abspath(state_path)), "trades.jsonl"))
+        if isinstance(dash, dict) and "error" in dash:
+            err = str(dash["error"])[:120]
+            _research_warn(("dashboard", err[:60]),
+                           "RESEARCH dashboard update failed (%s); trading "
+                           "unaffected" % err)
+        return dash
+    except Exception as e:
+        _research_warn(("dashboard", type(e).__name__),
+                       "RESEARCH dashboard update failed (%s: %s); trading "
+                       "unaffected" % (type(e).__name__, str(e)[:80]))
+        return None
 
 
 class ApiThrottled(Exception):
@@ -378,9 +683,9 @@ class DexScreenerSource:
             buys = int(tx.get("buys") or 0)
             sells = int(tx.get("sells") or 0)
             liq = (p.get("liquidity") or {}).get("usd") or 0
-            if float(pc) < self.d.get("min_m5_gain_pct", 5):
+            if to_f(pc) < self.d.get("min_m5_gain_pct", 5):
                 return None
-            if float(vol) < self.d.get("min_m5_volume_usd", 2000):
+            if to_f(vol) < self.d.get("min_m5_volume_usd", 2000):
                 return None
             if buys < self.d.get("min_m5_buys", 10):
                 return None
@@ -389,23 +694,26 @@ class DexScreenerSource:
             ratio = buys / max(sells, 1)
             if ratio < self.d.get("min_buy_sell_ratio", 1.5):
                 return None
-            if float(liq) < self.d.get("min_liquidity_usd", 0):
+            if not math.isfinite(float(liq)) or to_f(liq) < self.d.get("min_liquidity_usd", 0):
+                return None
+            if not math.isfinite(float(pc)) or not math.isfinite(float(vol)):
                 return None
             lp_burn, lp_lock = lp_evidence(p)
             return {
                 "name": bt.get("name") or bt.get("symbol") or mint[:8],
                 "mint": mint, "pool": p.get("pairAddress"),
                 "chain": "solana",
-                "m15_gain_pct": round(float(pc), 1),  # 5m window; key kept
+                "m15_gain_pct": round(to_f(pc), 1),  # 5m window; key kept
                 "buy_sell_ratio": round(ratio, 1),
                 "m15_buys": buys, "m15_sells": sells,
-                "liquidity_usd": round(float(liq)),
-                "m15_volume_usd": round(float(vol)),
-                "mcap_usd": round(float(p.get("marketCap")
-                                        or p.get("fdv") or 0)),
+                "liquidity_usd": round(to_f(liq)),
+                "m15_volume_usd": round(to_f(vol)),
+                "mcap_usd": round(to_f(p.get("marketCap")
+                                       or p.get("fdv") or 0)),
                 "signal_price_usd": optional_positive_float(p.get("priceUsd")),
                 "lp_burn_pct": lp_burn,
                 "lp_locked": lp_lock,
+                "pool_created_at": journal.pool_created_at(p),
                 "pool_url": p.get("url") or "",
                 "source": "dexscreener", "window_label": "5m",
                 "ts": time.time(),
@@ -503,10 +811,10 @@ def ata_address(owner: Pubkey, mint: Pubkey) -> Pubkey:
 
 
 # ---------------- Jupiter swap ----------------
-def jup_quote(input_mint, output_mint, amount_raw, slippage_bps):
+def jup_quote(input_mint, output_mint, amount_raw, slippage_bps, timeout=20):
     url = ("%s/quote?inputMint=%s&outputMint=%s&amount=%d&slippageBps=%d"
            % (JUP_BASE, input_mint, output_mint, amount_raw, slippage_bps))
-    return http_get(url)
+    return http_get(url, timeout=timeout)
 
 
 def jup_swap_tx(quote_resp, owner_str, max_priority_fee_lamports):
@@ -560,6 +868,40 @@ def quote_with_retry(label, fn, attempts=3, base_delay=2.0):
     raise last
 
 
+def _race_price(jup_fn, ds_fn, budget=4.0, headstart=0.8):
+    """First valid price wins between two racing callables.
+
+    jup_fn gets `headstart` seconds alone (the common case costs exactly
+    one request). If it hasn't answered, ds_fn fires too and the first
+    finite positive price wins. Returns None when neither yields a valid
+    price within `budget`. A raising leg is treated as failed; a leg that
+    returns an invalid price (None/0/NaN/inf) is ignored so the other leg
+    can still win.
+    """
+    results = queue.Queue()
+
+    def run(fn):
+        try:
+            px = fn()
+        except Exception:
+            return
+        if isinstance(px, (int, float)) and math.isfinite(px) and px > 0:
+            results.put(float(px))
+
+    tj = threading.Thread(target=run, args=(jup_fn,), daemon=True)
+    tj.start()
+    try:
+        return results.get(timeout=headstart)
+    except queue.Empty:
+        pass
+    td = threading.Thread(target=run, args=(ds_fn,), daemon=True)
+    td.start()
+    try:
+        return results.get(timeout=max(0.05, budget - headstart))
+    except queue.Empty:
+        return None
+
+
 # ---------------- FOMO hunter ----------------
 class Hunter:
     """Finds violent buy-pressure pumps. Nothing else qualifies."""
@@ -607,7 +949,7 @@ class Hunter:
         # Partial scans are fine.
         for path, net in paths:
             try:
-                items = gt_get(path, self.cfg, timeout=15).get("data", [])
+                items = gt_get(path, self.cfg, timeout=15).get("data", []) or []
                 pages_ok += 1
             except ApiThrottled:
                 # circuit open: fail fast and degrade this scan, never hammer
@@ -619,7 +961,11 @@ class Hunter:
                 # single attempt, no retry: retries deepen the penalty
                 continue
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 attrs = item.get("attributes") or {}
+                if not isinstance(attrs, dict):
+                    continue
                 addr = attrs.get("address")
                 if not addr:
                     continue
@@ -669,46 +1015,50 @@ class Hunter:
             # strict native-pair enforcement per chain (SOL pairs on Solana,
             # WBNB pairs on BSC): the non-native entries in the journal
             # (Claude/ANTHRP, USDC/USDC) all came from quote leaks.
-            if not native_pair_ok(net, a, mint, qt_mint):
+            try:
+                if not native_pair_ok(net, a, mint, qt_mint):
+                    continue
+                pc = a.get("price_change_percentage") or {}
+                vol = a.get("volume_usd") or {}
+                tx = a.get("transactions") or {}
+                liq = to_f(a.get("reserve_in_usd"))
+                p15 = to_f(pc.get("m15"))
+                if p15 < min_gain or liq < min_liq:
+                    continue
+                if max_liq and liq > max_liq:
+                    continue  # too big = slow large-cap, not a frenzy
+                if to_f(vol.get("m15")) < min_vol:
+                    continue
+                t = tx.get("m15", {}) or {}
+                buys, sells = int(t.get("buys", 0)), int(t.get("sells", 0))
+                if buys < min_buys:
+                    continue
+                if sells < min_sells:
+                    continue  # nobody is able to sell = possible honeypot
+                ratio = buys / max(sells, 1)
+                if ratio < min_ratio:
+                    continue
+                lp_burn, lp_lock = lp_evidence(a)
+                signals.append({
+                    "name": a.get("name"), "mint": mint, "pool": addr,
+                    "chain": net,
+                    "m15_gain_pct": round(p15, 1),
+                    "buy_sell_ratio": round(ratio, 1),
+                    "m15_buys": buys, "m15_sells": sells,
+                    "liquidity_usd": round(liq),
+                    "m15_volume_usd": round(to_f(vol.get("m15"))),
+                    "mcap_usd": round(to_f(a.get("market_cap_usd"))
+                                       or to_f(a.get("fdv_usd"))),
+                    "signal_price_usd": optional_positive_float(a.get("base_token_price_usd")),
+                    "lp_burn_pct": lp_burn,
+                    "lp_locked": lp_lock,
+                    "pool_created_at": journal.pool_created_at(a),
+                    "pool_url": "https://www.geckoterminal.com/%s/pools/%s" % (net, addr),
+                    "source": "geckoterminal", "window_label": "15m",
+                    "ts": time.time(),
+                })
+            except (TypeError, ValueError, OverflowError, AttributeError):
                 continue
-            pc = a.get("price_change_percentage") or {}
-            vol = a.get("volume_usd") or {}
-            tx = a.get("transactions") or {}
-            liq = to_f(a.get("reserve_in_usd"))
-            p15 = to_f(pc.get("m15"))
-            if p15 < min_gain or liq < min_liq:
-                continue
-            if max_liq and liq > max_liq:
-                continue  # too big = slow large-cap, not a frenzy
-            if to_f(vol.get("m15")) < min_vol:
-                continue
-            t = tx.get("m15", {}) or {}
-            buys, sells = int(t.get("buys", 0)), int(t.get("sells", 0))
-            if buys < min_buys:
-                continue
-            if sells < min_sells:
-                continue  # nobody is able to sell = possible honeypot
-            ratio = buys / max(sells, 1)
-            if ratio < min_ratio:
-                continue
-            lp_burn, lp_lock = lp_evidence(a)
-            signals.append({
-                "name": a.get("name"), "mint": mint, "pool": addr,
-                "chain": net,
-                "m15_gain_pct": round(p15, 1),
-                "buy_sell_ratio": round(ratio, 1),
-                "m15_buys": buys, "m15_sells": sells,
-                "liquidity_usd": round(liq),
-                "m15_volume_usd": round(to_f(vol.get("m15"))),
-                "mcap_usd": round(to_f(a.get("market_cap_usd"))
-                                   or to_f(a.get("fdv_usd"))),
-                "signal_price_usd": optional_positive_float(a.get("base_token_price_usd")),
-                "lp_burn_pct": lp_burn,
-                "lp_locked": lp_lock,
-                "pool_url": "https://www.geckoterminal.com/%s/pools/%s" % (net, addr),
-                "source": "geckoterminal", "window_label": "15m",
-                "ts": time.time(),
-            })
         signals.sort(key=lambda s: s["m15_gain_pct"], reverse=True)
         if pages_ok < len(paths):
             log("scan degraded: %d/%d pages ok" % (pages_ok, len(paths)))
@@ -730,52 +1080,56 @@ class Hunter:
             e_min_sells = ecfg.get("min_m15_sells", 3)
             e_min_ratio = ecfg.get("min_buy_sell_ratio", 1.5)
             for (net, addr), (a, mint, qt_mint) in pools.items():
-                if not mint or (net, mint) in seen_mints:
+                try:
+                    if not mint or (net, mint) in seen_mints:
+                        continue
+                    if not native_pair_ok(net, a, mint, qt_mint):
+                        continue
+                    pc = a.get("price_change_percentage") or {}
+                    vol = a.get("volume_usd") or {}
+                    tx = a.get("transactions") or {}
+                    liq = to_f(a.get("reserve_in_usd"))
+                    p5 = to_f(pc.get("m5"))
+                    p15 = to_f(pc.get("m15"))
+                    if not (e_min_m5 <= p5 <= e_max_m5):
+                        continue
+                    if p15 < e_min_m15 or p15 <= p5 * e_accel:
+                        continue  # not accelerating: move is stalling
+                    if liq < e_min_liq:
+                        continue
+                    if to_f(vol.get("m15")) < e_min_vol:
+                        continue
+                    t = tx.get("m15", {}) or {}
+                    buys, sells = int(t.get("buys", 0)), int(t.get("sells", 0))
+                    if buys < e_min_buys or sells < e_min_sells:
+                        continue
+                    ratio = buys / max(sells, 1)
+                    if ratio < e_min_ratio:
+                        continue
+                    seen_mints.add((net, mint))
+                    lp_burn, lp_lock = lp_evidence(a)
+                    early.append({
+                        "name": a.get("name"), "mint": mint, "pool": addr,
+                        "chain": net,
+                        "m5_gain_pct": round(p5, 1),
+                        "m15_gain_pct": round(p15, 1),
+                        "buy_sell_ratio": round(ratio, 1),
+                        "m15_buys": buys, "m15_sells": sells,
+                        "liquidity_usd": round(liq),
+                        "m15_volume_usd": round(to_f(vol.get("m15"))),
+                        "mcap_usd": round(to_f(a.get("market_cap_usd"))
+                                           or to_f(a.get("fdv_usd"))),
+                        "signal_price_usd": optional_positive_float(a.get("base_token_price_usd")),
+                        "lp_burn_pct": lp_burn,
+                        "lp_locked": lp_lock,
+                        "pool_created_at": journal.pool_created_at(a),
+                        "pool_url": "https://www.geckoterminal.com/%s/pools/%s" % (net, addr),
+                        "source": "geckoterminal", "window_label": "5m",
+                        "early": True,
+                        "ts": time.time(),
+                    })
+                except (TypeError, ValueError, OverflowError, AttributeError):
                     continue
-                if not native_pair_ok(net, a, mint, qt_mint):
-                    continue
-                pc = a.get("price_change_percentage") or {}
-                vol = a.get("volume_usd") or {}
-                tx = a.get("transactions") or {}
-                liq = to_f(a.get("reserve_in_usd"))
-                p5 = to_f(pc.get("m5"))
-                p15 = to_f(pc.get("m15"))
-                if not (e_min_m5 <= p5 <= e_max_m5):
-                    continue
-                if p15 < e_min_m15 or p15 <= p5 * e_accel:
-                    continue  # not accelerating: move is stalling
-                if liq < e_min_liq:
-                    continue
-                if to_f(vol.get("m15")) < e_min_vol:
-                    continue
-                t = tx.get("m15", {}) or {}
-                buys, sells = int(t.get("buys", 0)), int(t.get("sells", 0))
-                if buys < e_min_buys or sells < e_min_sells:
-                    continue
-                ratio = buys / max(sells, 1)
-                if ratio < e_min_ratio:
-                    continue
-                seen_mints.add((net, mint))
-                lp_burn, lp_lock = lp_evidence(a)
-                early.append({
-                    "name": a.get("name"), "mint": mint, "pool": addr,
-                    "chain": net,
-                    "m5_gain_pct": round(p5, 1),
-                    "m15_gain_pct": round(p15, 1),
-                    "buy_sell_ratio": round(ratio, 1),
-                    "m15_buys": buys, "m15_sells": sells,
-                    "liquidity_usd": round(liq),
-                    "m15_volume_usd": round(to_f(vol.get("m15"))),
-                    "mcap_usd": round(to_f(a.get("market_cap_usd"))
-                                       or to_f(a.get("fdv_usd"))),
-                    "signal_price_usd": optional_positive_float(a.get("base_token_price_usd")),
-                    "lp_burn_pct": lp_burn,
-                    "lp_locked": lp_lock,
-                    "pool_url": "https://www.geckoterminal.com/%s/pools/%s" % (net, addr),
-                    "source": "geckoterminal", "window_label": "5m",
-                    "early": True,
-                    "ts": time.time(),
-                })
             early.sort(key=lambda s: s["m5_gain_pct"] / max(s["m15_gain_pct"], 1),
                        reverse=True)  # earliest-first: most of the move still ahead
         self.last_early = early
@@ -814,50 +1168,80 @@ class Trader:
         self._bsc_down = False
         self.dry_run = cfg.get("dry_run", True)
         self.decimals_cache = {}
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.pending_entries = set()
         # per-mint recent (ts, price) for the dump detector; in-memory only,
         # rebuilt after restarts (arms within ~a minute of managing).
         self._px_hist = {}
+        # Research instrumentation (journal.py): candidate-observation
+        # tracker. Additive only; never influences entry decisions.
+        self._obs_tracker = journal.ObservationTracker()
         try:
             with open(state_path) as f:
                 self.state = json.load(f)
-        except Exception:
+            if (not isinstance(self.state, dict)
+                    or not isinstance(self.state.get("positions"), dict)
+                    or not isinstance(self.state.get("cooldown"), dict)
+                    or not isinstance(self.state.get("trades_today"), list)):
+                raise ValueError("state schema missing positions/cooldown/trades_today")
+        except Exception as e:
+            log("STATE LOAD FAILED (%s: %s); using empty paper state"
+                % (type(e).__name__, e))
             self.state = {"positions": {}, "cooldown": {}, "trades_today": [],
                           "trades_this_hour": [],
                           "day": time.strftime("%Y-%m-%d"), "realized_sol": 0.0,
                           "realized_bnb": 0.0, "realized_usd": 0.0}
         self._roll_day()
+        # Paper bankroll: seeded once from the journal's all-time P&L.
+        money.ensure_state(self.state, self.cfg)
+        _jp = os.path.join(os.path.dirname(os.path.abspath(state_path)),
+                           "trades.jsonl")
+        _seed = money.seed_from_journal(self.state, self.cfg, _jp)
+        if _seed.get("seeded"):
+            self.save()
+            log("BANKROLL seeded at $%.2f from journal all-time P&L "
+                "(%d priced closes, %d skipped without USD)" %
+                (_seed["bankroll_usd"], _seed["priced_closes"],
+                 _seed["skipped_closes"]))
+        log("BANKROLL $%.2f | peak $%.2f | drawdown %.1f%%" %
+            (self.state.get("bankroll_usd", 0.0),
+             self.state.get("equity_peak_usd", 0.0),
+             money.drawdown_pct(self.state)))
         log("wallet sol=%s bsc=%s | DRY RUN: %s"
             % (_short(self.owner_str),
                _short(self.bsc.address) if self.bsc else "none",
                self.dry_run))
 
     def _roll_day(self):
-        today = time.strftime("%Y-%m-%d")
-        if self.state.get("day") != today:
-            self.state.update({"day": today, "trades_today": [],
-                               "realized_sol": 0.0, "realized_bnb": 0.0,
-                               "realized_usd": 0.0})
-        self.state.setdefault("trades_this_hour", [])
-        self.state.setdefault("realized_bnb", 0.0)
-        self.state.setdefault("realized_usd", 0.0)
-        self.state.setdefault("dump_cooldown", {})
+        with self.lock:
+            today = time.strftime("%Y-%m-%d")
+            if self.state.get("day") != today:
+                self.state.update({"day": today, "trades_today": [],
+                                   "realized_sol": 0.0, "realized_bnb": 0.0,
+                                   "realized_usd": 0.0})
+                # Snapshot today's starting bankroll for the dynamic cap.
+                money.roll_day(self.state, self.cfg)
+            self.state.setdefault("trades_this_hour", [])
+            self.state.setdefault("realized_bnb", 0.0)
+            self.state.setdefault("realized_usd", 0.0)
+            self.state.setdefault("dump_cooldown", {})
 
     def _prune_hour_trades(self):
         """Rolling 60-minute window: drop entries older than an hour. This
         is the automated hourly reset - no manual reset, no midnight
         boundary, no action needed."""
-        now = time.time()
-        hour = self.state.setdefault("trades_this_hour", [])
-        self.state["trades_this_hour"] = [t for t in hour if now - t < 3600]
-        return self.state["trades_this_hour"]
+        with self.lock:
+            now = time.time()
+            hour = self.state.setdefault("trades_this_hour", [])
+            self.state["trades_this_hour"] = [t for t in hour if now - t < 3600]
+            return self.state["trades_this_hour"]
 
     def save(self):
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.state, f, indent=1)
-        os.replace(tmp, self.state_path)
+        with self.lock:
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.state, f, indent=1)
+            os.replace(tmp, self.state_path)
 
     # -- helpers --
     def decimals(self, mint):
@@ -889,28 +1273,67 @@ class Trader:
             log("price quote failed %s: %s" % (mint[:8], e))
         # FALLBACK: DexScreener fresh quote -> SOL. Logged as FALLBACK so a
         # bad fallback price can never silently drive an exit decision.
+        px = self.ds_price_sol(mint)
+        if px:
+            log("FALLBACK price %s: %.9f SOL/token via DexScreener"
+                % (mint[:8], px))
+            return px
+        log("FALLBACK price %s: no usable DexScreener quote" % mint[:8])
+        return None
+
+    def ds_price_sol(self, mint):
+        """SOL per token via DexScreener's best-liquidity pair. Single shot,
+        never raises: this is the racing leg for exits and the fallback for
+        entries. None when unusable - callers must never exit on a stale
+        price."""
         try:
             resp = requests.get(
                 "https://api.dexscreener.com/latest/dex/tokens/" + mint,
                 timeout=10).json()
-            pairs = resp.get("pairs") or []
-            if pairs:
-                best = max(pairs, key=lambda p: (
-                    p.get("liquidity") or {}).get("usd") or 0)
-                usd = float(best.get("priceUsd") or 0)
-                solusd = self.sol_usd()
-                if usd > 0 and solusd and solusd > 0:
-                    px = usd / solusd
-                    log("FALLBACK price %s: %.9f SOL/token via DexScreener "
-                        "($%.6f, SOL $%.2f)" % (mint[:8], px, usd, solusd))
-                    return px
-                log("FALLBACK price %s: unusable DexScreener data "
-                    "(usd=%s solusd=%s)" % (mint[:8], usd, solusd))
-            else:
-                log("FALLBACK price %s: no DexScreener pairs" % mint[:8])
         except Exception as e:
-            log("FALLBACK price failed %s: %s" % (mint[:8], e))
+            log("DS price failed %s: %s" % (mint[:8], e))
+            return None
+        pairs = resp.get("pairs") or []
+        if not pairs:
+            return None
+        best = max(pairs, key=lambda p: (
+            p.get("liquidity") or {}).get("usd") or 0)
+        try:
+            usd = float(best.get("priceUsd") or 0)
+        except (TypeError, ValueError):
+            return None
+        solusd = self.sol_usd()
+        if usd > 0 and solusd and solusd > 0:
+            return usd / solusd
         return None
+
+    def price_sol_fast(self, mint, budget=4.0, headstart=0.8):
+        """Exit-path SOL/token price: Jupiter races DexScreener.
+
+        Jupiter gets `headstart` seconds alone, so the common case costs
+        exactly one request, as today. If it hasn't answered, the
+        DexScreener leg fires and the first valid price wins. Hard `budget`
+        cap (default 4s) instead of the ~74s the patient retry chain could
+        burn (3x20s timeouts + 2/4/8s backoff) - a stall that hit hardest
+        during dumps, exactly when exits matter most. None when neither
+        answers: callers must never exit on a stale price."""
+        d = self.decimals(mint)  # cached; no network
+
+        def jup_leg():
+            q = jup_quote(mint, SOL_MINT, 10 ** d,
+                          self.cfg["exit"].get("slippage_bps", 500),
+                          timeout=5)
+            return int(q["outAmount"]) / 1e9
+
+        return _race_price(jup_leg, lambda: self.ds_price_sol(mint),
+                           budget=budget, headstart=headstart)
+
+    def price_native_fast(self, mint, chain):
+        """Exit-path price with a hard latency budget (see price_sol_fast).
+        BSC already single-shots DexScreener; only SOL gets the race."""
+        if (chain or "solana") == "bsc":
+            return self.price_bnb(mint)
+        return self.price_sol_fast(mint)
 
     def venue_m5_dump(self, mint, chain="solana"):
         """DexScreener's own 5-minute price change for the best (highest
@@ -1052,12 +1475,106 @@ class Trader:
         st = self.state
         # kill switch: USD-denominated so it covers SOL and BSC together.
         # Enforce both configured limits; a USD limit must not mask the SOL one.
+        # The USD cap is adaptive: min(fixed cap, daily_loss_pct * day-start
+        # bankroll), so it tightens automatically as the bankroll shrinks.
         usd_cap = r.get("kill_switch_max_daily_loss_usd")
+        eff_cap = money.effective_daily_loss_cap_usd(st, self.cfg, usd_cap)
         sol_cap = r.get("kill_switch_max_daily_loss_sol",
                         0.5 if usd_cap is None else None)
-        return ((usd_cap is not None and
-                 st.get("realized_usd", 0.0) <= -usd_cap) or
+        return ((eff_cap is not None and
+                 st.get("realized_usd", 0.0) <= -eff_cap) or
                 (sol_cap is not None and st["realized_sol"] <= -sol_cap))
+
+    def _drawdown_brake(self):
+        """True while the bankroll drawdown brake is engaged (entries blocked,
+        open positions tightened). Hysteresis: engages at max_drawdown_pct,
+        releases below drawdown_resume_pct."""
+        return money.entries_blocked_by_drawdown(self.state, self.cfg)
+
+    def _risk_halted(self):
+        """Either the daily kill switch or the drawdown brake is tripped."""
+        return self._kill_switch_tripped() or self._drawdown_brake()
+
+    def _bankroll_ticket(self, configured_native, native_usd):
+        """Cap a trade's native ticket at the bankroll-derived USD ceiling.
+
+        ticket_usd = risk_per_trade_pct * bankroll / hard_stop_pct, so a
+        full hard-stop loss costs exactly risk_per_trade_pct of bankroll.
+        Never raises size above the configured fixed ticket; falls back to
+        the configured size when no USD rate is available.
+        """
+        try:
+            hard = (self.cfg.get("exit") or {}).get("hard_stop_pct", 35)
+            ceil_usd = money.ticket_usd_ceiling(self.state, self.cfg, hard)
+            if ceil_usd and native_usd and native_usd > 0:
+                return min(configured_native, ceil_usd / native_usd)
+        except Exception:
+            pass
+        return configured_native
+
+    def _risk_ceiling_native(self, native_usd):
+        """money.py risk ceiling in native units, or None if unavailable."""
+        try:
+            hard = (self.cfg.get("exit") or {}).get("hard_stop_pct", 35)
+            ceil_usd = money.ticket_usd_ceiling(self.state, self.cfg, hard)
+            if ceil_usd and native_usd and native_usd > 0:
+                return ceil_usd / native_usd
+        except Exception:
+            pass
+        return None
+
+    def _allocate(self, signal, chain, configured_native, native_usd,
+                  entry, holder=None):
+        """Allocator decision at entry commit, after _entry_commit_ok().
+
+        Returns (buy_native, journal_fields, skip). The 1.0x ticket is the
+        existing _bankroll_ticket(). Shadow mode always trades that ticket
+        and only journals what the allocator would have done; live mode
+        applies take/skip and min(configured * multiplier, risk ceiling).
+        No `allocator` config section -> off (no fields, legacy behavior).
+        Pure local arithmetic: native_usd is the rate already fetched for
+        bankroll sizing, never a new fetch."""
+        base = self._bankroll_ticket(configured_native, native_usd)
+        acfg = self.cfg.get("allocator")
+        mode = allocator.mode_of(acfg)
+        if mode == "off":
+            return base, None, False
+        try:
+            feats = allocator.features_from_signal(
+                signal, chain, entry, native_usd, holder, time.time())
+            balance = {"bankroll_usd": self.state.get("bankroll_usd"),
+                       "equity_peak_usd": self.state.get("equity_peak_usd"),
+                       "max_drawdown_pct": (self.cfg.get("money") or {}).get(
+                           "max_drawdown_pct", 15.0)}
+            take, score, mult, bfactor = allocator.score_signal_with_balance(
+                feats, balance, acfg)
+            error = False
+        except Exception:
+            (take, score, mult), error = allocator.FALLBACK, True
+            bfactor = 1.0
+        try:
+            sized = allocator.size_native(
+                configured_native, mult,
+                self._risk_ceiling_native(native_usd))
+        except Exception:
+            (take, score, mult), error = allocator.FALLBACK, True
+            bfactor = 1.0
+            sized = base
+        fields = {"allocator_mode": mode,
+                  "allocator_score": round(score, 6),
+                  "allocator_take": bool(take),
+                  "allocator_multiplier": round(mult, 6),
+                  "allocator_balance_factor": round(bfactor, 6),
+                  "allocator_base_native": base,
+                  "allocator_would_be_native": sized if take else 0.0}
+        if error:
+            fields["allocator_error"] = True
+        if mode != "live":
+            return base, fields, False
+        if not take:
+            return None, fields, True
+        fields["allocator_applied_native"] = sized
+        return sized, fields, False
 
     # -- entries --
     def _dump_cooldown_active(self, signal):
@@ -1069,6 +1586,19 @@ class Trader:
             return True
         return False
 
+    def _effective_max_trades_per_day(self):
+        # Profit-boost rule (user-set 2026-09-27): once the day's locked
+        # profit reaches the threshold, the daily trade cap lifts from the
+        # base to the boosted value. Hourly cap and all other guardrails
+        # still apply.
+        r = self.cfg["risk"]
+        base = r.get("max_trades_per_day", 10)
+        thr = r.get("profit_boost_threshold_usd", 10.0)
+        boost = r.get("profit_boost_trades_per_day", 40)
+        if (self.state.get("realized_usd") or 0.0) >= thr:
+            return boost
+        return base
+
     def guardrails_ok(self, signal):
         r = self.cfg["risk"]
         self._roll_day()
@@ -1076,12 +1606,17 @@ class Trader:
         if self._kill_switch_tripped():
             log("KILL SWITCH: daily loss limit hit, no new entries")
             return False
+        if self._drawdown_brake():
+            log("DRAWDOWN BRAKE: %.1f%% from equity peak, no new entries"
+                % money.drawdown_pct(st))
+            return False
         if self._dump_cooldown_active(signal):
             return False
         if len(st["positions"]) >= r.get("max_open_positions", 3):
             return False
-        if len(st["trades_today"]) >= r.get("max_trades_per_day", 10):
-            log("max trades/day reached")
+        max_day = self._effective_max_trades_per_day()
+        if len(st["trades_today"]) >= max_day:
+            log("max trades/day reached (%d)" % max_day)
             return False
         # hourly pacing: rolling 60-min window, resets itself automatically
         if len(self._prune_hour_trades()) >= r.get("max_trades_per_hour", 3):
@@ -1180,6 +1715,11 @@ class Trader:
             if not net_fail:
                 log("RUG-GUARD SKIP %s: no sell route on Jupiter (honeypot)"
                     % name)
+            maybe_capture_failed_quote(
+                self.cfg, self.state_path, mint, "solana",
+                "honeypot_quote_unreachable" if net_fail else "honeypot_no_sell_route",
+                {"name": name, "sell_in_amount_raw": tokens_raw,
+                 "sell_out_amount_raw": rout})
             return False
         return True
 
@@ -1216,13 +1756,18 @@ class Trader:
         r = self.cfg["risk"]
         hour_trades = self._prune_hour_trades()
         if (len(self.state["trades_today"])
-                >= r.get("max_trades_per_day", 10)
+                >= self._effective_max_trades_per_day()
                 or len(hour_trades)
                 >= r.get("max_trades_per_hour", 3)):
             log("cap reached at entry commit, skipping %s" % name)
+            _maybe_capture_failure(self, signal, "commit_cap",
+                                   open_positions=len(self.state["positions"]),
+                                   trades_today=len(self.state["trades_today"]),
+                                   trades_this_hour=len(hour_trades))
             return False
-        if self._kill_switch_tripped():
-            log("KILL SWITCH tripped at entry commit, skipping %s" % name)
+        if self._risk_halted():
+            log("RISK HALT tripped at entry commit, skipping %s" % name)
+            _maybe_capture_failure(self, signal, "commit_kill_switch")
             return False
         entry_cfg = (self.cfg.get("hunter") or {}).get("entry") or {}
         try:
@@ -1314,7 +1859,10 @@ class Trader:
         if signal.get("chain", "solana") == "bsc":
             return self.enter_bsc(signal)
         r = self.cfg["risk"]
-        buy_sol = r.get("buy_sol_per_trade", 0.1)
+        # The configured ticket sizes the entry quote. The bankroll cap is
+        # applied at commit time (after _entry_commit_ok) so a rejected
+        # commit never pays for a USD rate fetch.
+        cfg_buy = r.get("buy_sol_per_trade", 0.1)
         mint = signal["mint"]
         name = signal["name"]
         max_open = r.get("max_open_positions", 3)
@@ -1368,7 +1916,7 @@ class Trader:
                     log("SKIP %s: no pullback in %ds, not chasing top"
                         % (name, wait))
                     return
-            amount_lamports = int(buy_sol * 1e9)
+            amount_lamports = int(cfg_buy * 1e9)
             d = self.decimals(mint)  # fail fast before touching the swap
             try:
                 quote = jup_quote(SOL_MINT, mint, amount_lamports,
@@ -1379,6 +1927,9 @@ class Trader:
                 # doesn't happen (fail closed).
                 log("SKIP %s: entry quote failed (%s: %s)"
                     % (name, type(e).__name__, str(e)[:90]))
+                _maybe_capture_failure(self, signal, "entry_quote_failed",
+                                       in_amount_raw=amount_lamports,
+                                       error_type=type(e).__name__)
                 return
             tokens_raw = int(quote.get("outAmount") or 0)
             if tokens_raw < 10_000 * (10 ** d):
@@ -1386,26 +1937,52 @@ class Trader:
                 # execute at an absurd price. Skip instead of "buying" air.
                 log("SKIP %s: no liquid route (quote out=%s raw units)"
                     % (name, quote.get("outAmount")))
+                _maybe_capture_failure(self, signal, "dust_quote",
+                                       in_amount_raw=amount_lamports,
+                                       out_amount_raw=tokens_raw)
                 return
             if not self.honeypot_check(mint, name, tokens_raw):
                 return
             out_est, sig = self.send_quote(quote, "BUY %s" % name)
             # entry price: SOL spent per token received (use quote estimate)
             tokens_est = int(out_est) / (10 ** d) if out_est else 0
-            entry = buy_sol / tokens_est if tokens_est else self.price_sol(mint)
+            entry = cfg_buy / tokens_est if tokens_est else self.price_sol(mint)
             with self.lock:
                 # Commit-time guardrails (trade caps + kill switch), rechecked
                 # under the lock minutes after guardrails_ok() ran.
                 if not self._entry_commit_ok(signal):
                     self.pending_entries.discard(mint)
                     return
+                # Bankroll ticket sizing lands here, on the commit path only:
+                # the USD rate is fetched only when the entry actually
+                # commits. A shrunken ticket scales the quoted token amount
+                # linearly; the per-token entry price is unchanged. (Live
+                # mode is disabled; the pre-lock quote still executes at the
+                # configured size there.) The allocator is an additional
+                # filter after the commit guardrails; the risk ceiling wins.
+                buy_sol, alloc_rec, alloc_skip = self._allocate(
+                    signal, "solana", cfg_buy, self.sol_usd(), entry,
+                    holder_evidence)
+                if alloc_skip:
+                    log("ALLOCATOR SKIP %s score=%.3f"
+                        % (name, alloc_rec["allocator_score"]))
+                    self.pending_entries.discard(mint)
+                    return
+                # Positive-slip (chase) veto: user-ordered 2026-09-28. Vetoes
+                # entries filling above the signal print; fail-open when slip
+                # cannot be measured. Vetoed entries are journaled as
+                # slip_veto events for retrospective validation.
+                if self._slip_veto(signal, entry, self.sol_usd(), "solana"):
+                    self.pending_entries.discard(mint)
+                    return
+                scale = (buy_sol / cfg_buy) if cfg_buy else 1.0
                 self.state["positions"][mint] = {
                     "name": name, "entry": entry, "peak": entry,
                     "buy_sol": buy_sol, "buy_sig": sig,
                     "rungs_fired": [], "opened_at": time.time(),
                     "last_price_ts": time.time(),
                     # virtual ledger (dry_run): exact paper accounting
-                    "tokens_raw": tokens_raw, "sold_sol": 0.0,
+                    "tokens_raw": int(tokens_raw * scale), "sold_sol": 0.0,
                     "decimals": d,
                 }
                 self.state["cooldown"][mint] = time.time()
@@ -1416,10 +1993,11 @@ class Trader:
             native_usd = self.sol_usd()
             enrichment = entry_evidence(signal, entry, native_usd,
                                         holder_evidence)
+            maybe_tag_research(enrichment, self.cfg)
             with self.lock:
                 self.state["positions"][mint].update(enrichment)
                 self.save()
-            self._journal({
+            self._journal(journal.finalize_entry_record({
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "type": "entry",
                 "mint": mint, "name": name, "entry": entry,
                 "buy_sol": buy_sol, "buy_sig": sig,
@@ -1429,7 +2007,7 @@ class Trader:
                 "liquidity_usd": signal.get("liquidity_usd"),
                 "source": signal.get("source"),
                 "window": signal.get("window_label"),
-                **enrichment})
+                **enrichment, **(alloc_rec or {})}, signal))
             log("entered %s @ %.9f SOL/token (%.1f%% under signal)"
                 % (name, entry or 0,
                    (1 - (entry or ref) / ref) * 100 if ref else 0))
@@ -1448,7 +2026,10 @@ class Trader:
         then a paper buy on the virtual ledger (live swaps stay dormant
         while dry_run=true)."""
         r = self.cfg["risk"]
-        buy_bnb = r.get("buy_bnb_per_trade", 0.01)
+        # Configured ticket sizes the entry quote; the bankroll cap is
+        # applied at commit time so a rejected commit never pays for a USD
+        # rate fetch.
+        cfg_buy = r.get("buy_bnb_per_trade", 0.01)
         mint = signal["mint"]
         name = signal["name"]
         max_open = r.get("max_open_positions", 3)
@@ -1469,10 +2050,13 @@ class Trader:
             if bsc is None:
                 log("SKIP %s: BSC unavailable" % name)
                 return
-            amount_wei = int(buy_bnb * 1e18)
+            amount_wei = int(cfg_buy * 1e18)
             ok, why = bsc.honeypot_check(mint, name, amount_wei)
             if not ok:
                 log("HONEYPOT SKIP %s: %s" % (name, why))
+                _maybe_capture_failure(self, signal, "bsc_honeypot",
+                                       in_amount_raw=amount_wei,
+                                       screen_reason=why)
                 return
             # anti-top: wait for a dip off the signal price (disabled when
             # entry.pullback_pct is 0, i.e. immediate market entry)
@@ -1514,13 +2098,19 @@ class Trader:
             except Exception as e:
                 log("SKIP %s: entry quote failed (%s: %s)"
                     % (name, type(e).__name__, str(e)[:90]))
+                _maybe_capture_failure(self, signal, "entry_quote_failed",
+                                       in_amount_raw=amount_wei,
+                                       error_type=type(e).__name__)
                 return
             if tokens_raw < 10_000 * (10 ** d):
                 log("SKIP %s: no liquid route (quote out=%d raw units)"
                     % (name, tokens_raw))
+                _maybe_capture_failure(self, signal, "dust_quote",
+                                       in_amount_raw=amount_wei,
+                                       out_amount_raw=tokens_raw)
                 return
             tokens_est = tokens_raw / (10 ** d)
-            entry = buy_bnb / tokens_est if tokens_est else self.price_bnb(mint)
+            entry = cfg_buy / tokens_est if tokens_est else self.price_bnb(mint)
             sig = signal.get("pool_url", "")
             with self.lock:
                 # Commit-time guardrails (trade caps + kill switch), rechecked
@@ -1528,6 +2118,38 @@ class Trader:
                 if not self._entry_commit_ok(signal):
                     self.pending_entries.discard(mint)
                     return
+                # Bankroll ticket sizing lands here, on the commit path only:
+                # the USD rate is fetched only when the entry actually
+                # commits. A shrunken ticket scales the quoted token amount
+                # linearly; the per-token entry price is unchanged. (Live
+                # mode is disabled; the pre-lock quote still executes at the
+                # configured size there.) The allocator is an additional
+                # filter after the commit guardrails; the risk ceiling wins.
+                buy_bnb, alloc_rec, alloc_skip = self._allocate(
+                    signal, "bsc", cfg_buy, self.bnb_usd(), entry)
+                if alloc_skip:
+                    log("ALLOCATOR SKIP %s score=%.3f"
+                        % (name, alloc_rec["allocator_score"]))
+                    self.pending_entries.discard(mint)
+                    return
+                buy_bnb, capped, slip = wipe_drift_cap_native(
+                    signal, entry, self.bnb_usd(), cfg_buy, buy_bnb)
+                # Positive-slip (chase) veto: user-ordered 2026-09-28. Runs
+                # before the drift cap: a vetoed entry never reaches it, so
+                # with the veto enabled the cap only fires when the veto is
+                # toggled off. Fail-open when slip cannot be measured.
+                if self._slip_veto(signal, entry, self.bnb_usd(), "bsc",
+                                   slip=slip):
+                    self.pending_entries.discard(mint)
+                    return
+                if capped:
+                    if alloc_rec is None:
+                        alloc_rec = {}
+                    alloc_rec["wipe_drift_cap"] = True
+                    alloc_rec["wipe_drift_slip"] = round(slip, 6)
+                    log("WIPE-DRIFT CAP %s: slip %+.2f%% -> ticket capped at 0.5x floor"
+                        % (name, slip * 100))
+                scale = (buy_bnb / cfg_buy) if cfg_buy else 1.0
                 self.state["positions"][mint] = {
                     "name": name, "chain": "bsc",
                     "entry": entry, "peak": entry,
@@ -1535,7 +2157,7 @@ class Trader:
                     "rungs_fired": [], "opened_at": time.time(),
                     "last_price_ts": time.time(),
                     # virtual ledger (dry_run): exact paper accounting
-                    "tokens_raw": tokens_raw, "sold_sol": 0.0,
+                    "tokens_raw": int(tokens_raw * scale), "sold_sol": 0.0,
                     "decimals": d,
                 }
                 self.state["cooldown"][mint] = time.time()
@@ -1545,7 +2167,7 @@ class Trader:
                 self.save()
             if self.dry_run:
                 log("DRY bsc buy %s: %d wei BNB -> %d token raw"
-                    % (name, amount_wei, tokens_raw))
+                    % (name, int(buy_bnb * 1e18), int(tokens_raw * scale)))
             else:
                 # live: the entry quote above was indicative; this sends it.
                 # In paper mode the quote IS the fill (virtual ledger).
@@ -1554,10 +2176,11 @@ class Trader:
                                 dry_run=False)
             native_usd = self.bnb_usd()
             enrichment = entry_evidence(signal, entry, native_usd)
+            maybe_tag_research(enrichment, self.cfg)
             with self.lock:
                 self.state["positions"][mint].update(enrichment)
                 self.save()
-            self._journal({
+            self._journal(journal.finalize_entry_record({
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "type": "entry",
                 "mint": mint, "name": name, "chain": "bsc",
                 "entry": entry, "buy_sol": buy_bnb, "buy_sig": sig,
@@ -1567,7 +2190,7 @@ class Trader:
                 "liquidity_usd": signal.get("liquidity_usd"),
                 "source": signal.get("source"),
                 "window": signal.get("window_label"),
-                **enrichment})
+                **enrichment, **(alloc_rec or {})}, signal))
             log("entered %s @ %.9f BNB/token (%.1f%% under signal)"
                 % (name, entry or 0,
                    (1 - (entry or ref) / ref) * 100 if ref else 0))
@@ -1663,7 +2286,7 @@ class Trader:
         with self.lock:
             self._roll_day()
             pos = self.state["positions"].get(mint)
-            if pos and self._kill_switch_tripped() and not pos.get("protect_mode"):
+            if pos and self._risk_halted() and not pos.get("protect_mode"):
                 # Keep protection through a day rollover: an open position's
                 # exit must never loosen just because the daily cap resets.
                 pos["protect_mode"] = True
@@ -1672,7 +2295,19 @@ class Trader:
                     % pos["name"])
         if not pos:
             return True
-        price = self.price_native(mint, pos.get("chain", "solana"))
+        price = self.price_native_fast(mint, pos.get("chain", "solana"))
+        if capture_settings(self.cfg)[0]:
+            chain = pos.get("chain", "solana")
+            # native_usd() can refresh over the network. Read its normal
+            # cached rate directly; capture must never add a request.
+            fx_key = "_bnb_usd" if chain == "bsc" else "_sol_usd"
+            fx_ts = getattr(self, fx_key + "_ts", 0)
+            fresh_fx = 0 <= time.time() - fx_ts < 120
+            fx = getattr(self, fx_key, None) if fresh_fx else None
+            maybe_capture_quote_tick(
+                self.cfg, self.state_path, mint, chain,
+                (lambda: price * fx) if price and fx else None,
+                None)
         if not price:
             # No price = no exits can fire. Track how long we've been
             # blind and scream about it instead of silently missing
@@ -1740,6 +2375,19 @@ class Trader:
                 wmax = p
         dump_drop = (wmax - price) / wmax * 100 if wmax > 0 else 0.0
         dumped = dump_drop >= dump_pct
+        shadow_enabled = (getattr(self, "dry_run", False)
+                          and ex.get("shadow_dump_detector", True))
+        if shadow_enabled and "shadow_dump_first" not in pos:
+            shadow = evaluate_shadow_dump(
+                hist, now_ts, price, None,
+                ex.get("shadow_dump_drop_pct", 8),
+                ex.get("shadow_dump_window_sec", 30),
+                ex.get("shadow_venue_dump_m5_pct", -20))
+            if shadow:
+                shadow.update({"ts": now_ts, "price": price,
+                               "venue_check_sec": ex.get("venue_check_sec", 30)})
+                pos["shadow_dump_first"] = shadow
+                log("SHADOW DUMP %s: %s" % (pos["name"], shadow))
 
         # take-profit ladder (rungs_fired stores [index, actual_gain_pct])
         fired = {r[0] if isinstance(r, (list, tuple)) else r
@@ -1806,6 +2454,20 @@ class Trader:
                     self.save()
             if venue_m5 is not None and venue_m5 <= vth:
                 venue_dumped = True
+        # Observation only: reuse this tick's quote ring and the venue value
+        # fetched by the live path. Never enter the sell decision branches.
+        if (shadow_enabled
+                and "shadow_dump_first" not in pos):
+            shadow = evaluate_shadow_dump(
+                hist, now_ts, price, venue_m5,
+                ex.get("shadow_dump_drop_pct", 8),
+                ex.get("shadow_dump_window_sec", 30),
+                ex.get("shadow_venue_dump_m5_pct", -20))
+            if shadow:
+                shadow.update({"ts": now_ts, "price": price,
+                               "venue_check_sec": vsec})
+                pos["shadow_dump_first"] = shadow
+                log("SHADOW DUMP %s: %s" % (pos["name"], shadow))
         # dump detector first: violent vertical drops exit NOW, before the
         # wider trailing stop even matters. This is the anti-rug reflex.
         if venue_dumped:
@@ -1868,6 +2530,66 @@ class Trader:
         with open(jp, "a") as f:
             f.write(json.dumps(rec) + "\n")
 
+    def _journal_candidate(self, signal, verdict):
+        """Research instrumentation: journal one scanner observation.
+
+        Called for EVERY signal the hunter surfaces, including ones that
+        fail guardrails and never become entries (verdict "guardrail_skip"
+        vs "enter"). Additive only: never affects entry decisions, never
+        raises. Uses a lazily-created tracker so test-constructed Traders
+        (no __init__) work too.
+        """
+        try:
+            tracker = getattr(self, "_obs_tracker", None)
+            if tracker is None:
+                tracker = journal.ObservationTracker()
+                self._obs_tracker = tracker
+            repeat = tracker.observe(signal)
+            basedir = os.path.dirname(os.path.abspath(self.state_path))
+            journal.journal_event(
+                basedir,
+                journal.sanitize_observation(signal, verdict=verdict,
+                                            repeat_info=repeat))
+        except Exception:
+            pass
+
+    def _slip_veto(self, signal, entry, native_usd, chain, slip=None):
+        """Positive-slip (chase) entry veto. Returns True when vetoed.
+
+        User-ordered 2026-09-28 (deep-research pass: vetoing slip>0 entries
+        raised walk-forward PF 0.254 -> 0.796 at 91% OOS retention on the
+        small validated sample). Config flag hunter.entry.veto_positive_slip
+        (default true); the user can toggle it later.
+
+        Fail-OPEN on missing data: when slip cannot be measured, log the
+        gap and proceed — never block an entry on instrumentation. Strict
+        > 0 threshold, no tolerance band. Vetoed entries are journaled as
+        slip_veto events with full would-be details so the improvement loop
+        can retrospectively study them. Never raises.
+        """
+        try:
+            entry_cfg = (self.cfg.get("hunter") or {}).get("entry") or {}
+            if not entry_cfg.get("veto_positive_slip", True):
+                return False
+            if slip is None:
+                slip = slip_from_signal(signal, entry, native_usd)
+            if slip is None:
+                log("SLIP-VETO GAP %s [%s]: slip unknown, proceeding "
+                    "(fail open)" % (signal.get("name"), chain))
+                return False
+            if slip > 0:
+                basedir = os.path.dirname(os.path.abspath(self.state_path))
+                journal.journal_event(
+                    basedir,
+                    journal.sanitize_veto(signal, entry, native_usd, slip,
+                                          chain))
+                log("SLIP-VETO %s [%s]: slip %+.2f%% > 0, skipping chase "
+                    "entry" % (signal.get("name"), chain, slip * 100))
+                return True
+            return False
+        except Exception:
+            return False
+
     def close_trade(self, mint, pos, exit_price, reason):
         """Pop a fully-exited position, compute exact realized P&L, journal it."""
         buy = pos.get("buy_sol", 0)
@@ -1928,6 +2650,7 @@ class Trader:
             with self.lock:
                 self.state["realized_usd"] = round(
                     self.state.get("realized_usd", 0.0) + realized_usd, 2)
+                money.apply_close(self.state, realized_usd)
                 self.save()
         unit = "BNB" if chain == "bsc" else "SOL"
         rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "type": "close",
@@ -1937,13 +2660,19 @@ class Trader:
                "realized_sol": realized if chain != "bsc" else None,
                "realized_bnb": realized if chain == "bsc" else None,
                "realized_usd": realized_usd,
+               "bankroll_usd": self.state.get("bankroll_usd"),
+               "drawdown_pct": money.drawdown_pct(self.state),
                "sol_usd": self.sol_usd() if chain != "bsc"
                else self.bnb_usd()}
+        if pos.get("shadow_dump_first"):
+            rec["shadow_dump_first"] = pos["shadow_dump_first"]
+        maybe_tag_research(rec, getattr(self, "cfg", None), pos)
         self._journal(rec)
         usd_note = ""
         if realized_usd is not None:
             usd_note = " ($%+.2f)" % realized_usd
         log("%s CLOSED: %s | realized %+.6f %s%s" % (pos.get("name"), reason, realized, unit, usd_note))
+        maybe_research_dashboard(getattr(self, "cfg", None), self.state_path)
         return realized
 
     # -- main loop --
@@ -1999,20 +2728,24 @@ class Trader:
                     log("scan: %d FOMO signal(s)" % len(signals))
                     for s in signals:
                         if self.guardrails_ok(s):
+                            self._journal_candidate(s, "enter")
                             # threaded: pullback waits must not stall scanning
                             threading.Thread(target=self.enter, args=(s,),
                                              daemon=True).start()
                         else:
+                            self._journal_candidate(s, "guardrail_skip")
                             log("skip %s (guardrails)" % s["name"])
                     early = hunter.last_early or []
                     if early:
                         log("scan: %d pre-pump signal(s)" % len(early))
                         for s in early:
                             if self.guardrails_ok(s):
+                                self._journal_candidate(s, "enter")
                                 threading.Thread(
                                     target=self.enter, args=(s,),
                                     daemon=True).start()
                             else:
+                                self._journal_candidate(s, "guardrail_skip")
                                 log("skip %s (guardrails)" % s["name"])
                 except Exception:
                     log("hunter error:\n%s" % traceback.format_exc())

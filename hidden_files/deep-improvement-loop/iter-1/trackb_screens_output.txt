@@ -1,0 +1,32 @@
+=== BASELINE (no screen) ===
+  IS : kept 110/110  net=-167.44 pf=0.275 wr=0.2545 exp/trade=-1.5222 dd=171.9
+  OOS: kept 54/54  net=-59.17 pf=0.183 wr=0.3148 exp/trade=-1.0958 dd=61.24
+  OOS 3x-fee: net=-60.6 pf=0.173 wr=0.2963
+  baseline OOS (no screen): n=54 net=-59.17 pf=0.183 wr=0.3148 retention=0.665
+  screen OOS retention vs IS: 0.665 | OOS decay: 0.335 | OOS PF gain vs baseline: 0.0
+  VERDICT: FAIL  flags=['fails 3x-fee (PF<1)']  significant=False
+
+=== G1a: veto signal_gain >= 60 (NEW) ===
+  IS : kept 27/110  net=-0.45 pf=0.988 wr=0.4444 exp/trade=-0.0168 dd=18.5
+  OOS: kept 10/54  net=-7.1 pf=0.479 wr=0.4 exp/trade=-0.7101 dd=11.11
+  OOS 3x-fee: net=-7.31 pf=0.467 wr=0.4
+  baseline OOS (no screen): n=54 net=-59.17 pf=0.183 wr=0.3148 retention=0.665
+  screen OOS retention vs IS: 0.485 | OOS decay: 0.515 | OOS PF gain vs baseline: 0.296
+  VERDICT: FAIL  flags=['IS<100', 'OOS<30', 'retention<60%', 'fails 3x-fee (PF<1)']  significant=False
+
+=== G1b: veto signal_gain >= 100 (control; prior round tested) ===
+  IS : kept 41/110  net=-1.04 pf=0.982 wr=0.4634 exp/trade=-0.0254 dd=23.4
+  OOS: kept 20/54  net=-19.48 pf=0.321 wr=0.4 exp/trade=-0.9742 dd=21.55
+  OOS 3x-fee: net=-19.93 pf=0.31 wr=0.4
+  baseline OOS (no screen): n=54 net=-59.17 pf=0.183 wr=0.3148 retention=0.665
+  screen OOS retention vs IS: 0.327 | OOS decay: 0.673 | OOS PF gain vs baseline: 0.138
+  VERDICT: FAIL  flags=['IS<100', 'OOS<30', 'retention<60%', 'fails 3x-fee (PF<1)']  significant=False
+
+=== G2: veto positive slip (enriched subset only; shipped-veto reproduction) ===
+  IS : kept 86/110  net=-114.15 pf=0.335 wr=0.2907 exp/trade=-1.3273 dd=119.17
+  OOS: kept 33/54  net=-15.16 pf=0.451 wr=0.4242 exp/trade=-0.4594 dd=17.23
+  OOS 3x-fee: net=-16.22 pf=0.424 wr=0.4242
+  baseline OOS (no screen): n=54 net=-59.17 pf=0.183 wr=0.3148 retention=0.665
+  screen OOS retention vs IS: 1.346 | OOS decay: -0.346 | OOS PF gain vs baseline: 0.268
+  VERDICT: FAIL  flags=['IS<100', 'fails 3x-fee (PF<1)']  significant=False
+

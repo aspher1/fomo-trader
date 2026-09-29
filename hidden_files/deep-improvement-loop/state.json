@@ -1,0 +1,14 @@
+{
+  "goal": "Run the full 3-lane deep-research improvement pass on the FOMO Trader paper bot on loop until a SIGNIFICANT validated profitability improvement ships.",
+  "achieved": false,
+  "iterations": 2,
+  "note": "Iteration 0 is the coordinator pass launched 2026-09-28 ~12:05 EDT (reports at hidden_files/research-pass-2026-09-28/). Loop iterations start at 1.",
+  "significant_improvement_definition": "A shipped code change passing EVERY validation gate with walk-forward OOS profit-factor gain >= +0.25, and/or validated expected PnL/trade turning positive on >= 30 OOS trades, surviving 3x-fee stress.",
+  "last_run": {
+    "iteration": 2,
+    "started": "2026-09-28T20:07:00-04:00",
+    "status": "in_progress"
+  },
+  "achieved_at": null,
+  "achievement_summary": null
+}

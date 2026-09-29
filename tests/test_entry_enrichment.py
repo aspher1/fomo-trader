@@ -26,7 +26,7 @@ def trader(tmp_path, chain, account):
     t.state_path = str(tmp_path / "state.json")
     t.state = {"positions": {}, "cooldown": {}, "trades_today": [],
                "trades_this_hour": []}
-    t.lock = threading.Lock()
+    t.lock = threading.RLock()
     t.pending_entries = set()
     t.manage = lambda mint: None
     t._entry_commit_ok = lambda signal: True

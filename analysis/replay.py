@@ -32,7 +32,11 @@ def load_journal(path=JOURNAL):
     trades = []
     counts = defaultdict(int)
     for line in Path(path).open(encoding="utf-8"):
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            counts["malformed_lines"] += 1
+            continue
         kind = row.get("type")
         counts[kind] += 1
         if kind == "entry":

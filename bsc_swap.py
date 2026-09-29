@@ -123,11 +123,21 @@ class BscSwap:
 
     def quote_buy(self, token, bnb_wei):
         """Tokens out for bnb_wei in. Raises on failure (fail closed)."""
-        return self._amounts_out(int(bnb_wei), [WBNB, token])[-1]
+        return self._quote_amount(int(bnb_wei), [WBNB, token])
 
     def quote_sell(self, token, tokens_raw):
         """BNB wei out for tokens_raw in. Raises on failure (fail closed)."""
-        return self._amounts_out(int(tokens_raw), [token, WBNB])[-1]
+        return self._quote_amount(int(tokens_raw), [token, WBNB])
+
+    def _quote_amount(self, amount_in, path):
+        if amount_in <= 0:
+            raise ValueError("quote input must be positive")
+        amounts = self._amounts_out(amount_in, path)
+        if (not isinstance(amounts, (list, tuple)) or len(amounts) != 2
+                or any(type(value) is not int or value <= 0 for value in amounts)
+                or amounts[0] != amount_in):
+            raise ValueError("invalid BSC router quote")
+        return amounts[1]
 
     def honeypot_check(self, token, name, bnb_wei, min_roundtrip_pct=50):
         """Buy-quote then immediate sell-quote on the proceeds. A honeypot

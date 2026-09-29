@@ -3,6 +3,354 @@
 Every behavior change, with the evidence that motivated it. This is the
 paper-validation record: nothing here touches real money (dry_run=true).
 
+## 2026-09-28 — Follow-up fix: research instrumentation + allocator back to shadow + positive-slip veto (shipped)
+Three changes from the deep-research pass, all paper-only (dry_run=true
+intact). Full suite: 698 passed, 0 failed (venv pytest, coordinator shell).
+
+### A. Research instrumentation (journal.py, new; additive, zero behavior change)
+- New `journal.py`: `STRATEGY_VERSION = "1"` (bump only on strategy-behavior
+  changes, never for instrumentation). Appends scanner candidate
+  observations to `runs/paper-1h/candidates.jsonl` (NEW file; the protected
+  `trades.jsonl` is untouched) for EVERY signal, including guardrail rejects
+  (verdict `enter` vs `guardrail_skip`).
+- Each observation journals: symbol/mint/pool, chain, timestamp,
+  price/liquidity/volume, second-observation price via an in-memory
+  `ObservationTracker` (repeat sightings report `first_ts` +
+  `second_price_usd`), `pairCreatedAt`/pool-age (DexScreener ms normalized to
+  seconds; missing -> null, never crashes), source/window, and strategy
+  version. Rotation guard: single backup past 50 MB.
+- Every entry journal record now carries `strategy_version`,
+  `pool_created_at`, and gap-filled signed slip / liquidity / signal gain
+  (`finalize_entry_record`; never clobbers existing values).
+- Guarantees: journal functions never raise, never mutate inputs, never feed
+  back into decisions. 29 new tests in
+  `tests/test_fixup_2026_09_28.py`, including a no-mutation parity check.
+
+### B. Allocator reverted to shadow (runs/paper-1h/config.json)
+- `allocator.mode`: `live` -> `shadow`. It went live with uncalibrated priors
+  against the standing shadow verdict; no pass verdict exists in
+  `analysis/allocator_proposal.json`. Shadow still scores every commit and
+  journals `allocator_score/take/multiplier/would_be_native` but never skips
+  and never changes ticket size (1.0x). Tests assert shadow logs-but-does-not-
+  act and that the shipped live config is shadow.
+
+### C. Positive-slip (chase) veto — SHIPPED ON USER ORDER (behavior change)
+- New entry rule, both chains: at the commit point, if measured slip > 0
+  (fill above the signal print), the entry is vetoed — no position, journaled
+  as a `slip_veto` event in `candidates.jsonl` with full would-be details
+  (symbol/pool, price, slip, liquidity, signal gain, timestamp) for
+  retrospective validation. Config flag `hunter.entry.veto_positive_slip`
+  (default true; user-togglable). Strict > 0, no tolerance band.
+- Fail-OPEN on missing data: unknown slip logs a `SLIP-VETO GAP` line and
+  proceeds. With the veto enabled the pre-existing wipe-drift 0.5x cap never
+  fires (veto runs first); it still applies when the veto is toggled off.
+- HONEST CAVEAT: this overrides the deep pass's "inconclusive, don't ship
+  yet" verdict for this candidate ONLY. The validated walk-forward was PF
+  0.254 -> 0.796 at 91% OOS retention on a SMALL sample (n_IS=29 / n_OOS=18).
+  The 4h deep-improvement loop keeps validating with fresh data; everything
+  else keeps the verdict-only rule.
+- Unit tests: slip>0 vetoed + journaled; slip<=0 proceeds; slip unknown
+  proceeds + gap logged; flag off never vetoes; precomputed slip (BSC drift
+  path) honored.
+
+## 2026-09-28 — Track B Lane 3 — early-entry gain veto (verdict only, unshipped)
+- **Experimental, unshipped.** Frozen pre-entry predicate: veto when
+  `(signal_gain_pct or 0) >= 100.0`. If shipped, it would be an additional
+  filter in the hunter-to-entry handoff; it would not loosen guards or grow
+  tickets. The literal predicate keeps a missing gain (`None`), despite the
+  conflicting test instruction to veto `None`; the journal has no missing
+  gains in these pairs. No bot/config edit or restart was made.
+- Read-only FIFO journal replay: 160 pairs, 3 unmatched closes, 0 unmatched
+  entries. Close append-order split: 106 IS / 54 OOS; 0 boundary-crossing
+  pairs purged. Base/stress add 0.15%/0.45% slippage per leg, respectively,
+  while the 0.25% swap fee and fixed costs stay unchanged. Skipped trades
+  contribute $0; edge is divided by original cohort size.
+
+  | Gate or metric | IS base | IS stress | OOS base | OOS stress |
+  |---|---:|---:|---:|---:|
+  | Original / kept | 106 / 40 | 106 / 40 | 54 / 20 | 54 / 20 |
+  | Retention | 37.7% | 37.7% | 37.0% | 37.0% |
+  | Full net | -$163.77 | -$168.06 | -$56.78 | -$58.19 |
+  | Kept net | -$6.42 | -$8.22 | -$16.29 | -$16.75 |
+  | Edge per original trade | +$1.4844 | +$1.5079 | +$0.7498 | +$0.7674 |
+  | Kept WR / PF | 42.5% / 0.891 | 42.5% / 0.862 | 40.0% / 0.413 | 40.0% / 0.401 |
+  | Kept max drawdown | $24.14 | $25.47 | $18.59 | $18.78 |
+  | Wipes vetoed / kept | 4 / 4 | 4 / 4 | 7 / 3 | 7 / 3 |
+  | Winners vetoed | 7 | 7 | 9 | 8 |
+
+- **Gate table:** OOS edge retention is 50.5% base and 50.9% stress: FAIL
+  both >=60% gates. Original counts 106 IS / 54 OOS: PASS both minimums.
+  Kept OOS net -$16.29 base / -$16.75 stress: FAIL both positive-net
+  gates. Kept OOS count 20: FAIL the 30-retained minimum, so verdict is
+  **INCONCLUSIVE** regardless of other gates. Kept OOS WR 40.0%: PASS the
+  <=90% red-flag check. Edge decay 49.5% base / 49.1% stress: PASS the
+  <=70% red-flag check. The largest 20-close OOS block contributes 46.9%
+  of savings (blocks: $10.02, $19.00, $11.47, with 2/3/2 vetoed wipes):
+  no single block exceeds 70%. Kept OOS is 20 BSC trades, -$16.29 base;
+  there is no later Solana sample, so cross-chain robustness FAILS.
+- Verdict: **INCONCLUSIVE; do not ship.** Retained OOS losses and edge
+  retention also fail the shipping gates. Full suite: **669 passed, 0 failed**
+  (`TMPDIR=/home/hatch/workspace/tmp-codex .venv/bin/python -m pytest tests/ -q`).
+
+## 2026-09-28 — Track B Lane 2 Round 3 — BSC wipe-drift size cap (ships)
+- In `enter_bsc()`, after allocation and its skip check, positive
+  signal-to-commit price drift caps the paper ticket at the allocator's 0.5x
+  floor (`buy_bnb <= buy_bnb_before`). The pure `wipe_drift_cap_native()`
+  helper uses the already available entry price, signal USD price, and cached
+  BNB/USD rate. Capped entries log the decision and journal `wipe_drift_cap`
+  plus `wipe_drift_slip`; Solana entry and existing risk controls are unchanged.
+- Validation: 107 IS pairs, edge +$0.2164/trade base / +$0.2197 at 3x
+  slippage stress; 52 OOS pairs, edge +$0.2405 / +$0.2425, with 111.1% base
+  / 110.4% stress retention. OOS win rate 30.8%, PF 0.22, max drawdown
+  $56.35. The cap affected 20 IS and 24 OOS entries. OOS savings were
+  $12.50, 80.7% from 9 capped wipe trades; winner upside given up was $1.06.
+- Caveats: the bot remains unprofitable overall (OOS net -$56.35 after the
+  cap). The observed wipe leak is BSC-only; there is no cross-chain claim.
+  Journal slip uses a post-commit rate, while the live rule uses the cached
+  pre-write rate; sign agreement is expected. Paper mode stays enabled.
+- Full suite: **664 passed, 0 failed**
+  (`TMPDIR=/home/hatch/workspace/tmp-codex .venv/bin/python -m pytest tests/ -q`).
+
+## 2026-09-28 — Track B Round 5 and dump-shadow recheck (verdict only)
+- Read-only journal snapshot: 157 closes, 154 entries, 3 unmatched closes; FIFO
+  `(chain, mint)` pairing gives 87 enriched closes (58 IS / 29 OOS). The
+  pre-registered 30-close trigger is met, but the 100 IS / 30 OOS ship gate
+  is not. All 87 are BSC. Signal USD price, m15 buys/sells/volume, mcap,
+  liquidity, entry latency and slip are present on all 87; holder top-1/top-5
+  and LP fields are present on none. Holder veto remains `not_runnable`.
+- Costed baseline: IS -$61.43 on 58 closes (27.6% wins, PF 0.33, max drawdown
+  $61.63); OOS -$36.97 on 29 (20.7% wins, PF 0.07, max drawdown $37.60).
+  The frozen chase veto keeps 42 IS / 22 OOS, with -$22.88 / -$21.59 net;
+  OOS edge retention is 79.8%, but 3x-cost OOS is -$24.58. Commit-liquidity
+  keeps 50 / 22, with -$55.41 / -$24.63 net; retention is 410.1%, but
+  3x-cost OOS is -$27.51. Latency veto removes no trades and has zero edge.
+  `KILL_VARIANT` / `STOP_ALL` have insufficient OOS history (29 < 30), and
+  all-chain BSC concentration remains a red flag. Verdict: provisional,
+  `ship_recommend=false`; no bot rule is wired in.
+- Since the first shadow-marked close (2026-09-27 20:20:05 journal time), 55
+  closes include 42 dump, 9 venue-dump and 4 other exits. 54 carry a
+  `shadow_dump_first` marker: all 51 dump/venue closes and 3 other closes.
+  Marker source is quote for 52 and venue m5 for 2. In 38/42 dump and 6/9
+  venue closes, the recorded shadow price equals the exit mark, giving no
+  observed earlier price; the 3 other marked closes include 2 ordinary
+  trailing stops and 1 near-total trailing exit. Marks are not executable
+  fills. Verdict: **stay shadow**; no change to sell behavior.
+- Changed only this validation record. `dry_run=true` in the paper config and
+  code default remains true; no bot restart or run-file modification. Full
+  suite: **654 passed, 0 failed**
+  (`TMPDIR=/home/hatch/workspace/tmp-codex .venv/bin/python -m pytest tests/ -q`).
+
+## 2026-09-28 — Reject malformed BSC router quotes
+- BSC buy and sell quotes now require a positive input and an exact two-amount
+  router response with positive integer amounts whose first amount matches
+  the request. A malformed or zero-output quote raises instead of becoming
+  a paper fill; the existing entry and exit callers handle quote failures,
+  and the honeypot check fails closed.
+- Evidence: `quote_buy` and `quote_sell` previously accepted any response's
+  last element, including zero or a one-element response. Added 14 hermetic
+  cases in `tests/test_bsc_quote_validation.py` covering both directions,
+  malformed responses, input validation, and honeypot failure.
+- Full suite: **654 passed, 0 failed**
+  (`.venv/bin/python -m pytest tests/ -q`). No bot restart or run-file edit;
+  paper mode and risk settings are unchanged.
+
+## 2026-09-28 — Auto-apply validated allocator weights (closes the loop)
+- Added `analysis/apply_validated_weights.py`, run by the 2h cron after the
+  deterministic and LLM analyst passes. On a genuine "pass" verdict (all 7
+  gate checks green, OOS >= 30 closes, retention >= 60%), it copies ONLY the
+  validated `weights` from `analysis/allocator_proposal.json` into the live
+  `runs/paper-1h/config.json` allocator section — mode, take_threshold,
+  caps, kill switches and risk settings are never touched.
+- Safety: refuses unless `dry_run == true`; backs up config before writing;
+  applies each distinct proposal at most once (hash marker); graceful
+  SIGTERM restart with position-snapshot verification; on restart failure
+  or position mismatch it restores the backup and logs a loud ALERT.
+- A "fail"/"insufficient_data" verdict still changes nothing. Paper-only.
+- 16 hermetic tests in `tests/test_apply_validated_weights.py` (all process
+  interaction mocked; the real bot is never touched in tests).
+
+## 2026-09-28 — Offline LLM allocator analyst pass
+- Added `analysis/llm_analyst.py` after the deterministic cron pass. It uses
+  its own 25-new-priced-close watermark and sends compact journal evidence to
+  Codex via stdin. The bot entry and exit paths remain untouched.
+- Proposed weights use the existing replay costs, IS/OOS edge and retention
+  checks, and win-rate/chain/time concentration rejects. Only a passing gate
+  replaces `analysis/allocator_proposal.json`; failures are journaled in an
+  LLM report. Config changes remain manual.
+- Codex errors, timeouts, quota exhaustion, and invalid JSON exit 0 without
+  replacing the deterministic proposal or updating the LLM watermark.
+
+## 2026-09-28 — Paper allocator ticket aggression
+- Raised `MULT_MAX` from 2.0x to 3.0x; `MULT_MIN` remains 0.5x. The
+  deterministic, monotone piecewise-linear curve now passes through score
+  0 = 0.5x, 0.5 = 1.0x, 0.7 = 2.5x, and 1 = 3.0x. A strong 0.7 score reaches
+  the upper range while a typical 0.5 score stays at the base ticket.
+- The unconditional `money.py` risk ceiling still limits final size to
+  `min(configured ticket × multiplier, ceiling)`. At about $918 bankroll,
+  1.0% risk per trade and a 35% hard stop, the ceiling is approximately
+  0.01 × $918 / 0.35 = $26.2. A 3.0x multiplier on the $7 base ticket
+  therefore yields `min($21, $26.2) = $21`. The ceiling shrinks automatically
+  as bankroll falls; drawdown scaling can reduce the multiplier further.
+- Default weights remain uncalibrated priors. The previous offline validation
+  failed, and this sizing change makes no profitability or signal-edge claim.
+
+## 2026-09-28 — Dump latency candidate, shadow only
+- Added a pure local shadow detector (`shadow_dump.py`) using the manager's
+  existing per-mint quote ring and only the DexScreener m5 value already read
+  by the live tripwire. Candidate: quote drop >=8% within 30s; venue m5 <=-20%
+  on the existing 30s venue-check cadence. On paper ticks it logs the first
+  would-have-fired timestamp, price, source and params, and adds these to the
+  eventual close record. It never sells. `exit.shadow_dump_detector` defaults
+  on for dry-run measurement and cannot run with `dry_run=false`; the example
+  config documents the knobs. The live 12%/60s and -30%/30s thresholds, 2s
+  poll, TP ladder, trailing stop and hard stop are unchanged. No extra venue
+  request was added.
+- Read-only replay (`analysis/dump_latency_replay.py`) of all 64 dump/venue
+  closes: 12 near-total gap exits had $49.33 aggregate realized loss; 52
+  other exits had $52.00 aggregate realized loss (winning closes excluded from
+  the loss sums). DRA was a $7.00 loss, with captured quote marks jumping
+  directly from about $0.0005525 to $0.000000001642. For near-total gaps,
+  candidate savings are set to $0; older gaps lack tick histories and this
+  instant/gradual split is provisional.
+- Illustrative gradual savings: $48.71, comprising $0.26 from observed quote
+  crossings and $48.44 modeled for missing paths (rounding). The model uses a
+  linear 30s peak-to-exit descent plus one 2s poll after the 8% crossing;
+  prices are marks, not executable fills. Among 29 historical TP/trailing
+  closes, only one has a captured quote path; it showed zero early cuts and
+  $0 observed false-positive cost. The illustrative net is +$48.71 before
+  unknown false positives, impact and unavailable venue m5 history. Real
+  dumps can reverse or gap in one tick, so the model is not a forecast.
+- Recommendation: **stay shadow** at 8%/30s and m5 -20%/existing 30s check.
+  The observed-path benefit is just $0.26 and false-positive coverage is 1/29.
+  A one-tick -100% liquidity pull cannot be saved by a faster threshold.
+- Validation: `.venv/bin/python -m pytest -q` finished with 614 passed,
+  0 failed. Pure detector tests cover threshold/window, malformed history,
+  no I/O and timing; manage tests cover shadow-only observation, dry-run
+  gating and identical live sell decisions with shadow on/off.
+
+## 2026-09-27 — Round 5 enriched-entry pre-entry screen validation (awaiting data)
+- Diagnostic: holder and LP fields are genuinely unavailable on the current enriched entries, not lost by journal plumbing. All 32 enriched entries are BSC; BSC has no holder endpoint in this path, source LP fields are absent, and Solana's existing guard passes observed holder values through or skips unverifiable candidates. No bot code changed; holder screens are `not_runnable` on this journal. See `analysis/round5/DIAGNOSTIC.md`.
+- Added stdlib-only `analysis/round5/round5.py` with FIFO `(chain, mint)` joining, replay cost reuse, chronological IS/OOS metrics, fixed candidate gates, and KILL_VARIANT/STOP_ALL mechanics. `ROUND5_PREREGISTRATION.md` froze the four candidate vetoes at 2026-09-28 00:06:52 UTC before evaluation. The report is descriptive only: 29 paired enriched closes, below the 30-close trigger; **verdict: awaiting data, ship_recommend=false**. IS 19 closes costed −$13.84; OOS 10 costed −$3.81. The eight ≥10% slip entries contributed −$17.41, an unvalidated BSC-only concentration, not a filter result.
+- Added ten hermetic Round 5 tests. Refreshed stale Z3 golden test expectations for existing bankroll fields and BSC paper token rounding; no production behavior changed. Final full suite: **608 passed, 0 failed** (`.venv/bin/python -m pytest tests/ -q`). `dry_run=true` remains intact. The bot was not restarted; no `runs/paper-1h/` files were modified.
+
+## 2026-09-27 20:11 EDT - Balance-aware allocator sizing
+- Added `balance_factor`: the in-memory bankroll's drawdown from its equity
+  peak linearly reduces sizing from 1.0x to 0.5x at the configured maximum
+  drawdown; missing or invalid balance data is neutral.
+- Added `score_signal_with_balance`, which preserves the existing take and
+  score, applies the balance factor to the score multiplier, and clamps the
+  result to 0.5x-2.0x. Entry journals now record
+  `allocator_balance_factor` in shadow and live modes.
+- The money.py risk ceiling, rug guard, kill switches, trade caps, cooldowns,
+  and shadow/live/off behavior are unchanged.
+
+## 2026-09-28 - Entry allocator (shadow by default) + offline analyst loop
+- New `allocator.py`: a deterministic, pure-local scorer that runs at entry
+  commit (after `_entry_commit_ok()`, next to `_bankroll_ticket()`) in both
+  `enter()` (SOL) and `enter_bsc()`. No network, no AI/LLM, no subprocess,
+  no randomness; ~9 us/call. Score = logistic(intercept + sum of weights x
+  features normalized to [-1, 1]), from signal gain, liquidity, 15m
+  buys/sells/ratio/volume, mcap, Solana top-1/top-5 holder concentration,
+  signal-to-fill slippage (recomputed from the in-lock native/USD rate, since
+  the journal's `commit_price_usd` uses a post-commit fetch), entry latency and
+  chain. Null features are neutral. `take = score >= take_threshold` (0.35);
+  multiplier is monotone in score, 0.5x at 0, 1.0x at 0.5, 2.0x at 1. Any
+  allocator error falls back to take at 1.0x.
+- Sizing in live mode: `min(configured ticket x multiplier, money.py risk
+  ceiling)`. The ceiling always wins; with no USD rate the allocator can
+  shrink but never grow the ticket. `ALLOCATOR SKIP <name> score=<s>` opens
+  nothing, releases `pending_entries`, and does not count as a trade. The rug
+  guard, trade caps, kill switches, drawdown brake and cooldowns are
+  unchanged and are evaluated before the allocator.
+- Config: new `allocator` section (`mode`, `take_threshold`, `weights`) in
+  `runs/paper-1h/config.json` and `config.example.json`, **mode = shadow**.
+  Shadow trades exactly as before (1.0x, never skips) and journals
+  `allocator_mode/score/take/multiplier/base_native/would_be_native` on entry
+  records. Live adds `allocator_applied_native`. A missing section = off,
+  with byte-identical legacy journals. Default weights are mild priors: on
+  the 98 journaled entries they take 100% at 0.95x-1.15x (median 1.00x).
+- New `analysis/allocator_analyst.py` (cron, `0 */2 * * *`, see
+  `analysis/allocator_cron.md`). It reads the journal read-only, joins entries
+  to closes, attributes P&L by score/gain/liquidity/ratio quintiles and
+  chain, and fits a recency-weighted (14-day half-life, full journal) L2
+  logistic model. It then runs the gate: OOS = most recent max(30%, 30)
+  closes (else `insufficient_data`); IS edge > 0; OOS edge > 0 with >= 60%
+  retention (decay <= 70%); IS taken win rate <= 90%; no chain or time
+  tercile holding > 80% of the edge. Replay costs: 100 + 300 bps plus
+  SOL $0.60 / BSC $0.20 per trade, with linear ticket scaling. It no-ops
+  unless 25+ new closes have landed since `analysis/allocator_watermark.json`,
+  and it never writes the config.
+- First run on the live journal (75 priced closes, 45 IS / 30 OOS): verdict
+  **fail**. The edge passes the IS/OOS checks (+$0.53 vs +$0.59 per trade,
+  retention 1.11) but 98.5% of it comes from shrinking or skipping BSC, so it
+  is a chain filter, not a feature edge. Recency check: the recent 30% is
+  less negative than the older journal (-$0.44 vs -$0.95 per trade, z = 0.76,
+  within noise). The report flags this as recency-concentrated and does not
+  overweight it. Allocator stays in shadow.
+- Manual shadow -> live flip (only on verdict `pass`): copy `weights` from
+  `analysis/allocator_proposal.json` into `allocator.weights`, set
+  `allocator.mode` to `"live"`, restart the bot. `dry_run` stays true.
+- Tests: new `tests/test_allocator.py` (76 tests: bounds, determinism,
+  threshold boundary, error fallback, ceiling precedence, shadow vs live on
+  both chains, skip bookkeeping, analyst pass/fail/insufficient_data,
+  recency weights, watermark no-op). Exit path, manage loop and guardrails
+  untouched; bot not restarted.
+
+## 2026-09-27 17:43 EDT - E3 exit-architecture experiment pre-registered (awaiting data)
+- Pre-registered E3 in analysis/z5_exit_arch/E3_PREREGISTRATION.md (frozen
+  2026-09-27). Verdict: awaiting data. Z4 quote-path capture is still off,
+  so no qualifying path exists yet.
+- Built the offline harness analysis/z5_exit_arch/e3.py (stdlib only, no bot
+  import). It has a fail-closed Z4 loader, a tick-by-tick simulator, E1-style
+  costs ($10 notional, 30 bps venue, 100/500 bps entry/exit slippage,
+  2,000,000 lamports per transaction), a seeded 2/3-1/3 chronological split,
+  KILL_VARIANT/STOP_ALL, 60% OOS retention and a 3x cost stress. Proven on
+  synthetic paths only: tests/test_z5_exit_arch.py (11 tests) passes, and
+  the full suite stays green.
+- Variants vs the live ladder, all sharing the -40% hard stop and 12%/60s dump
+  detector:
+  (a) ratchet: arm at +20%; sell 50% of the remainder on each 10% pullback from
+      the running anchor (twice); 25% deep trail on the rest.
+  (b) time box: exit all at 20 minutes, or earlier on a 20% drop below the
+      mark-peak.
+  (c) vol-scaled: 5-minute realized vol per sqrt(minute), cutoff 0.05. High
+      vol: 20% rungs at +10/+20/+35% with a 20% trail. Low vol: 30% rungs at
+      +30/+60% with a 30% trail.
+- Data trigger: at least 30 closed trades, each with a Z4 path of at least 20
+  non-null marks. The first run will be runnable but NOT decision-capable
+  until the frozen variant has 30 or more OOS closes.
+- Marks are not fills: any positive result is a mark-implied bound that
+  still needs a fill-feasibility study. No profitability claim. No bot code
+  or config changed; nothing restarted.
+## 2026-09-27 — Track A robustness audit and conservative hardening
+- Added `analysis/trackA_robustness/AUDIT.md` and `STAFF_REVIEW.md`. Source review and a two-thread cap test verify the commit check and appends are atomic under the state lock; fallback engages only after zero GT pages; Solana and BSC entry paths retain their rug/honeypot screens regardless of signal source. The stale-signal network fetch still holds the state lock; production latency impact is unverified and no sequencing change was made.
+- Reproduced a lost hourly append: unlocked prune iterated an old list while another thread appended under the lock, then rebound the list to zero entries. A direct `save` also completed while another thread held the state lock. `Trader.lock` is now an `RLock`; prune and day rollover take it, and `save` takes it around temp write and replace. Both race tests pass after the patch; golden tests preserve normal prune/roll values and a two-thread one-slot cap accepts exactly one entry.
+- Failing-first tests demonstrated GT NaN gain passing, NaN liquidity crashing, DS NaN gain passing, GT `data: null` aborting the scan, malformed main/early pool fields or a non-object item aborting other pools, wrong-schema valid JSON breaking startup/guardrails, and one corrupt replay line aborting analysis. The corresponding fixes reject non-finite numeric input, treat null page data as empty, skip malformed pools, log and use default state on required-key schema failure, and count skipped malformed journal lines. Normal GT/DS signal values, finite conversions, and replay pairing have golden tests.
+- Six `Trader.__new__` lock assignments in four existing test files now use `RLock` like production; the first full-suite run hung on a test's old plain-lock fixture after introducing reentrant helpers. Final suite: **436 passed** (`TMPDIR=/home/hatch/workspace/tmp-codex .venv/bin/python -m pytest tests/ -q`), comprising 416 prior tests plus 20 Track A tests. No bot restart or run-file mutation.
+
+## 2026-09-27 — Track Z4: optional quote-path and failed-quote capture
+- Added opt-in `research.capture_quote_path` and `research.capture_failed_quotes` hooks in `fomo_trader.py`; both default off and the existing `research_settings` 3-tuple remains unchanged. No config, trade journal, state, decision rule, running process, or live run file was changed.
+- Quote paths append one row per manage tick under `quote_paths/<mint>.jsonl`, using the already fetched mark and only a fresh cached native/USD conversion; unavailable USD conversion and liquidity are explicit nulls. Each mint stops at 5,000 rows or 1 MiB. Failed entry quotes, dust quotes, honeypot screens, and commit cap/kill rejections append known economics to a locked `failed_quotes.jsonl`. General Solana RPC fallback is excluded because its retry client lacks trading context; see `analysis/z4_capture/README.md`.
+- Added `analysis/z4_capture/README.md`, `STAFF_REVIEW.md`, and 26 hermetic tests. Off-state Solana/BSC entry, position, and close fixtures remain byte-identical. Z4 tests: 26 passed; full suite: 416 passed (`PYTHONPATH=. .venv/bin/pytest tests/ -q`). The bare `pytest tests/ -q` command fails during collection because two existing test modules import project packages before adding the project root to Python's path.
+- Capture helper latency over 10,000 calls each: quote off p50/p99 0.000300/0.000391 ms, failed off 0.000291/0.000371 ms, quote on 0.042845/1.068002 ms, failed on 0.032188/1.027200 ms; all p99s below the 50 ms budget. At a 2-second poll, one full 5,000-row path spans 2.78 hours; three continuously occupied slots produce about 26 such paths/day, conservatively at most 26 MiB/day at the 1 MiB per-file cap. Failed-quote storage remains unbounded.
+
+## 2026-09-27 — Track Z3: $7 DLMM fee-ceiling test (KILLED) + observation-mode instrumentation (flags off)
+- Added `analysis/z3_lp_ceiling/` (`z3_lp_ceiling.py`, report, `STAFF_REVIEW.md`, `LOOKAHEAD_AUDIT.md`) and `tests/test_z3_lp_ceiling.py`. This is a synthetic upper bound: hermetic, no journal data, every input a labeled assumption biased toward the LP. Model output: `VERDICT: KILLED - $7 ticket, 30 pool-days: upper-bound net $0.00 (infeasible: required refundable deposits $7.17 exceed the $7 budget); the ceiling clears $0 only at tickets >= $7.18`.
+- **Verdict: KILLED for the $7 ticket.** The refundable rent deposits a DLMM position and its token accounts need total 0.0624 SOL, which is $7.17 at SOL $115 (below every journal SOL price). That exceeds the $7 budget, so the 30-pool-day upper-bound net is $0.00, even with 0.7%/pool-day compounded fees, zero IL, perfect placement, no failed transactions and zero priority fees. It is a knife-edge, disclosed in the report. At SOL below $112.20, or without the wSOL account, the ceiling is at most +$0.18 over 30 days, and one 0.01 SOL priority fee erases that. A hypothetical small (1-bin) position account would make it +$1.12. Current Meteora position rent is unverified (a zero-cost check, STAFF_REVIEW objection 1), so the kill is conditional on it. The $25 and $100 ceilings clear $0 ($3.32 and $17.28), but raising the ticket is out of scope. A conditional 30d IS / 60d OOS follow-up is pre-registered in the report and was not run.
+- Added observation mode, strictly additive and off by default:
+  - A new top-level `research` config section (`enabled`, `tag_trades`, `question_id`, `dashboard`, `field_audit`). A missing section is all-off. Malformed values fail safe to off with one log line per cause and never raise. No config file was changed; the flags ship off.
+  - In `fomo_trader.py`: `research_settings`, `registered_question_ids`, `maybe_tag_research` and `maybe_research_dashboard`. `enter`/`enter_bsc` tag the entry enrichment, so both the journal record and the position carry `research_question`, and `close_trade` copies it from the position. The dashboard runs after a close only when `research.dashboard` is on.
+  - New files: `research_questions.json` (Q1–Q8, open); `obs_dashboard.py`, which scores the report's 8 consolidated kill criteria into `analysis/obs/kill_dashboard.json` as ok/TRIPPED plus `evaluable`; `analysis/obs/field_usage_audit.py` (offline; flags fields unused for 14+ days and deletes nothing); `analysis/obs/bench_research_hooks.py`. On the current journal the dashboard reports: `program_killed=True tripped=[6] not_evaluable=[1, 2, 3, 4, 5, 7, 8]`.
+- Behavior-neutral proof: with `research` absent, null, disabled or malformed (13 variants × Solana/BSC), entry records, position dicts and close records are byte-identical to golden records captured from the pre-change code, and the dashboard is never called. Tag helper p50/p99 with flags on: 0.003575/0.004046 ms over 10,000 calls (budget 50 ms). Dashboard update on the live journal: p50/p99 3.129174/5.190015 ms, and it only runs when its flag is on.
+- No journal, risk guard, position sizing or kill switch changed; `dry_run=true` intact; no restart. New Z3 tests: 113 passed, 0 failed. Full hermetic suite: 390 passed, 0 failed (`.venv/bin/python -m pytest tests/ -q`). Built by Cursor session B, which could not write to the repo or run Python, so the files were staged in /tmp and applied with `/tmp/z3_apply.py`.
+
+## 2026-09-27 — Track Y3 fade-the-signal diagnostic (no change recommended)
+- Added `analysis/y3_fade/fade.py`, 6 hermetic tests, `y3_fade.json`, `y3_fade_report.md`, `LOOKAHEAD_AUDIT.md`, `STAFF_REVIEW.md`. 74 closed trades.
+- Diagnostic REJECTS the premise: median peak/entry 1.260 (+26% post-entry run), 74% of trades peak ≥10% above entry, median give-back 29%. The signal is not backwards — the exit ladder is the bleed (first +100% TP rung reached by ~11% of trades; 29 losers ran +27% then collapsed to 0.2× peak).
+- Pullback-entry variant (enter at entry×(1−X), X=10/15/20/30%) structurally killed: fills are provable from the journal only when exit ≤ entry×(1−X), so every provable fill is a loser — PF 0.000, WR 0.00 at every X, IS/OOS, under 3× slippage. All 27 winners have unprovable fills; even the impossible best case (every winner dips exactly X% then rips) stays negative OOS.
+- **ship_recommend: false.** No bot, config, journal, or risk guard changed; no restart. Full hermetic suite: 238 passed, 0 failed. Implemented directly in coordinator shell (Codex CLI read-only-sandbox failure mode; X2 precedent).
+- Ops note: host rebooted ~20:16 UTC during this track; the pre-reboot bot process is gone and was not restarted per lane restriction — relaunch via run_bot.sh.
+
 ## 2026-09-27 — Track B offline exit sweep (no exit change recommended)
 - Added `analysis/exit_sweep.py`, 9 hermetic tests, and `analysis/exit_sweep_report.md`. The read-only journal snapshot had 73 closes; used first 45 by `close_ts` as IS and final 28 as OOS (round 2's 45/22 split had 67 closes).
 - Swept 467 sets across one- and two-rung TP thresholds/fractions, trailing and hard stops, stale timeout and gain threshold, dump threshold and window, and post-TP trail. The strongest IS region was TP `[[30,100]]` plus 10% trail, with nearby ladders and 15–20% trails retaining IS edge; OOS trail sensitivity was absent. No set passed all gates.
@@ -483,3 +831,8 @@ smaller and less frequent. Expectancy is still unproven at 19 trades.
   log scan. Fix: `ex = self.cfg["exit"]` at the top of _manage_once().
 - Lesson: any edit touching the exit path gets a manage-cycle smoke test
   before the bot is considered healthy.
+
+## auto-tune — 2026-09-28 11:14:11
+- Applied `hunter.min_buy_sell_ratio`: 1.5 -> 2.0
+- Rationale: raise hunter.min_buy_sell_ratio 1.5 -> 2.0 (geckoterminal-sourced: 153 trades, -0.437174 SOL - tighten buy pressure requirement)
+- Context: 157 closed trades, PF 0.49. Auto-applied by the daily self-improvement loop (paper mode only).

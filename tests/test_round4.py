@@ -21,7 +21,7 @@ def paper_trader(tmp_path):
                     "trades_this_hour": [], "day": time.strftime("%Y-%m-%d"),
                     "realized_sol": 0, "realized_bnb": 0,
                     "realized_usd": 0}
-    trader.lock = threading.Lock()
+    trader.lock = threading.RLock()
     trader._px_hist = {}
     return trader
 

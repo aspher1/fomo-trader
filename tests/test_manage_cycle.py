@@ -126,6 +126,7 @@ class PriceFeed:
 
 def wire(t, feed):
     t.price_sol = feed.price
+    t.price_native_fast = lambda mint, chain="solana": feed.price(mint)
     t.execute_swap = feed.swap
     t.venue_m5_dump = lambda mint, chain="solana": None  # venue tape quiet unless overridden
     t.sol_usd = lambda: 115.0   # hermetic USD stamping
