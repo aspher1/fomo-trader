@@ -80,6 +80,40 @@ def test_pool_created_at_missing_is_none_not_crash():
     assert pool_created_at({"pairCreatedAt": -5}) is None
 
 
+# ---------------- Task A: pool age, ISO-8601 strings (GeckoTerminal) ---------
+# Added 2026-09-29 by the 6h improvement loop: GT pool payloads carry
+# created_at as an ISO-8601 string, which previously journaled as null
+# (100% null pool_created_at in the deep-research lane). Pure instrumentation:
+# pool age never feeds entry/exit decisions, and STRATEGY_VERSION stays "1".
+
+def test_pool_created_at_iso_zulu():
+    assert pool_created_at({"pool_created_at": "2026-09-28T16:25:16Z"}) == 1790612716.0
+
+
+def test_pool_created_at_iso_with_offset():
+    # +02:00 offset must normalize to the same UTC instant
+    assert pool_created_at({"created_at": "2026-09-28T18:25:16+02:00"}) == 1790612716.0
+
+
+def test_pool_created_at_iso_key_priority():
+    # First recognized key wins; ISO and numeric paths mix freely
+    assert pool_created_at({"pairCreatedAt": 1790612716000}) == 1790612716.0
+    assert pool_created_at({"poolCreatedAt": 1790612716}) == 1790612716.0
+
+
+def test_pool_created_at_iso_bad_or_naive_is_none_not_crash():
+    assert pool_created_at({"created_at": "bad-date"}) is None
+    # naive (no tz) strings are skipped rather than guessed
+    assert pool_created_at({"created_at": "2026-09-28T16:25:16"}) is None
+    assert pool_created_at({"created_at": ""}) is None
+    assert pool_created_at({"created_at": None}) is None
+
+
+def test_pool_created_at_iso_does_not_bump_strategy_version():
+    # Instrumentation-only change: decisions must not see a version bump
+    assert STRATEGY_VERSION == "1"
+
+
 # ---------------- Task A: observation sanitizing ----------------
 
 def test_sanitize_observation_full_signal():

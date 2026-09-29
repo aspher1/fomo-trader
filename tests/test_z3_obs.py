@@ -37,7 +37,7 @@ ABSENT = object()
 # runs of tests/test_entry_enrichment.py, clock pinned to T). Includes the
 # 2026-09-28 instrumentation fields (strategy_version, pool_created_at).
 GOLDEN_ENTRY = {
-    "solana": '{"ts": "2026-09-27 12:00:00", "type": "entry", "mint": "MINT", '
+    "solana": '{"ts": "2026-09-27 12:00:00", "ts_epoch": 1790500000.0, "type": "entry", "mint": "MINT", '
               '"name": "TEST", "entry": 6e-08, "buy_sol": 0.06, '
               '"buy_sig": "dryrun-1790500000", "sol_usd": 100.0, '
               '"signal_gain_pct": 50, "signal_ratio": 2, "liquidity_usd": 20000, '
@@ -49,7 +49,7 @@ GOLDEN_ENTRY = {
               '"lp_burn_pct": null, "lp_locked": null, "entry_latency_ms": 1000, '
               '"m15_buys": 20, "m15_sells": 10, "m15_volume_usd": 5000, '
               '"mcap_usd": 100000, "strategy_version": "1", "pool_created_at": null}',
-    "bsc": '{"ts": "2026-09-27 12:00:00", "type": "entry", "mint": "0xMINT", '
+    "bsc": '{"ts": "2026-09-27 12:00:00", "ts_epoch": 1790500000.0, "type": "entry", "mint": "0xMINT", '
            '"name": "TEST", "chain": "bsc", "entry": 9e-09, "buy_sol": 0.009, '
            '"buy_sig": "pool", "sol_usd": 800.0, "signal_gain_pct": 50, '
            '"signal_ratio": 2, "liquidity_usd": 20000, "source": "geckoterminal", '
@@ -62,12 +62,12 @@ GOLDEN_ENTRY = {
            '"mcap_usd": 100000, "strategy_version": "1", "pool_created_at": null}',
 }
 GOLDEN_CLOSE = {
-    "solana": '{"ts": "2026-09-27 12:00:00", "type": "close", "mint": "MINT", '
+    "solana": '{"ts": "2026-09-27 12:00:00", "ts_epoch": 1790500000.0, "type": "close", "mint": "MINT", '
               '"name": "TEST", "chain": "solana", "entry": 1e-09, "peak": 2e-09, '
               '"exit": 1.5e-09, "buy_sol": 0.06, "rungs": [[0, 50.0]], '
               '"reason": "trailing stop -25.0% from peak", "realized_sol": 0.03, '
               '"realized_bnb": null, "realized_usd": 3.0, "bankroll_usd": 3.0, "drawdown_pct": 0.0, "sol_usd": 100.0}',
-    "bsc": '{"ts": "2026-09-27 12:00:00", "type": "close", "mint": "0xMINT", '
+    "bsc": '{"ts": "2026-09-27 12:00:00", "ts_epoch": 1790500000.0, "type": "close", "mint": "0xMINT", '
            '"name": "TEST", "chain": "bsc", "entry": 9e-09, "peak": 9e-09, '
            '"exit": 8e-09, "buy_sol": 0.009, "rungs": [], "reason": "test close", '
            '"realized_sol": null, "realized_bnb": 0.001, "realized_usd": 0.8, '
@@ -453,7 +453,7 @@ def test_dashboard_failure_never_breaks_close(tmp_path, capsys):
 # -- dashboard criteria -----------------------------------------------------
 
 def _close(i, net, peak=1.0, exit_=0.9, **kw):
-    d = {"ts": "2026-09-27 12:00:00", "type": "close", "mint": "M%d" % i,
+    d = {"ts": "2026-09-27 12:00:00", "ts_epoch": 1790500000.0, "type": "close", "mint": "M%d" % i,
          "entry": 1.0, "peak": peak, "exit": exit_, "buy_sol": 0.06,
          "realized_usd": net}
     d.update(kw)
