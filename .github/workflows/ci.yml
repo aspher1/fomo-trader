@@ -20,6 +20,8 @@ jobs:
           cache-dependency-path: setup.sh
       - name: Install test and application dependencies
         run: python -m pip install pytest requests solders bip-utils web3 base58
+      - name: Set up a sample research fixture
+        run: mkdir -p runs/paper-1h && cp config.example.json runs/paper-1h/config.json
       - name: Run offline tests (never start live trading)
         env:
           PYTHONPATH: .
