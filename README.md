@@ -20,6 +20,11 @@
 
 <!-- portfolio-intro:end -->
 
+
+> **Security hold (October 2026):** Do not deploy the included public VPS dashboard or connect a funded wallet. The historical dashboard/deployment path exposes a bearer-token control URL over plain HTTP, and disabling \`dry_run\` can initiate real on-chain transactions. This has not passed an independent security review. Historical live-run instructions below are preserved for code inspection, **not recommended for use**. Review or simulate locally without wallet credentials instead.
+
+
+
 ## Experimental strategy and operation
 
 Buys **only** FOMO setups: violent buy-pressure pumps (100%+ in 15 min with
