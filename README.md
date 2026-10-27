@@ -20,7 +20,7 @@
 
 <!-- portfolio-intro:end -->
 
-# FOMO Trader — end-to-end automated memecoin system (Solana)
+## Experimental strategy and operation
 
 Buys **only** FOMO setups: violent buy-pressure pumps (100%+ in 15 min with
 buys crushing sells 10-to-1 or better — the NPC/POOPFUN pattern). Then it
