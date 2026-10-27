@@ -1,6 +1,8 @@
 <!-- portfolio-intro:start -->
 # FOMO Trader | Experimental Crypto Automation
 
+[![CI status](https://github.com/aspher1/fomo-trader/actions/workflows/ci.yml/badge.svg)](https://github.com/aspher1/fomo-trader/actions/workflows/ci.yml)
+
 **A Python experimental system for researching and automating high-volatility token momentum strategies.** It includes candidate discovery, risk constraints, order-management logic and monitoring tools.
 
 **Tech:** Python, public DEX data integrations, Jupiter swap integration, local state, test suite and dashboard modules.
