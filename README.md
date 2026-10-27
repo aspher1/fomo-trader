@@ -1,3 +1,23 @@
+<!-- portfolio-intro:start -->
+# FOMO Trader | Experimental Crypto Automation
+
+**A Python experimental system for researching and automating high-volatility token momentum strategies.** It includes candidate discovery, risk constraints, order-management logic and monitoring tools.
+
+**Tech:** Python, public DEX data integrations, Jupiter swap integration, local state, test suite and dashboard modules.
+
+**Engineering highlights**
+- Explicit candidate filters and position-management rules.
+- Risk limiting, state tracking and operational monitoring.
+- Automated strategy tests and research utilities.
+
+**Explore:** [Tests](tests/) · [Allocator](allocator.py) · [Journal](journal.py) · [Analysis](analysis/)
+
+**Risk and scope:** This is **high-risk experimental trading software**, not a demonstrated profitable strategy. Unlike the paper-only research project above, the code supports **real wallet actions** when `dry_run` is disabled. Do not fund or deploy it without independent security assessment. Never commit wallet keys. Simulated performance does not guarantee live results.
+
+---
+
+<!-- portfolio-intro:end -->
+
 # FOMO Trader — end-to-end automated memecoin system (Solana)
 
 Buys **only** FOMO setups: violent buy-pressure pumps (100%+ in 15 min with
