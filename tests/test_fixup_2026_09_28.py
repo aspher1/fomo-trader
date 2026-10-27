@@ -14,6 +14,7 @@ Covers:
 import copy
 import json
 import os
+from pathlib import Path
 import threading
 import time
 
@@ -332,8 +333,9 @@ def test_veto_accepts_precomputed_slip(tmp_path):
 
 def test_allocator_mode_shadow_in_live_config():
     import allocator
-    cfg = json.load(open("/home/hatch/workspace/fomo-trader/"
-                         "runs/paper-1h/config.json"))
+    config_path = Path(__file__).resolve().parents[1] / "runs" / "paper-1h" / "config.json"
+    with config_path.open(encoding="utf-8") as fp:
+        cfg = json.load(fp)
     assert allocator.mode_of(cfg.get("allocator")) == "shadow"
 
 
